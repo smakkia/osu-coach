@@ -1,4 +1,4 @@
-# Builds dist\osu-coach-Setup-<version>.exe, the installer to attach to a GitHub release:
+# Builds dist\osu-coach-Setup-<version>-windows_x64.exe, the installer to attach to a GitHub release:
 #   1. the app with PyInstaller (dist\osu-coach: osu-coach.exe and its libraries, without scikit-learn)
 #   2. the map data from this PC's %LOCALAPPDATA%\osu-coach (the type guesser as plain arrays, and its guesses)
 #   3. the installer with Inno Setup 6 (winget install JRSoftware.InnoSetup)
@@ -37,7 +37,7 @@ try {
     if (-not $Iscc) { throw "Inno Setup 6 not found: winget install JRSoftware.InnoSetup" }
     & $Iscc /Q "/DAppVersion=$Version" tools\setup.iss
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
-    $Setup = Join-Path $Dist "osu-coach-Setup-$Version.exe"
+    $Setup = Join-Path $Dist "osu-coach-Setup-$Version-windows_x64.exe"
     Write-Host ("{0}: {1:N1} MB" -f $Setup, ((Get-Item $Setup).Length / 1MB)) -ForegroundColor Green
 } finally {
     Pop-Location

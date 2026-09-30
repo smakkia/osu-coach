@@ -10,7 +10,6 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -36,7 +35,7 @@ SKILLSETS_PATH = CACHE_DIR / "ui_skillsets.json"      # the Skills section's sta
 SETUP_STATS_PATH = CACHE_DIR / "ui_setup_stats.json"  # what the area / key advice measured in the plays
 ELO_PATH = CACHE_DIR / "ui_elo.json"                  # the Improvement page: ratings per skillset, day by day
 IMPORTED_DIR = CACHE_DIR / "imported"                 # replays added from the file manager
-BROWSER_PROFILE = CACHE_DIR / "ui_browser"            # the app window's own browser profile
+WEBVIEW_STORAGE = CACHE_DIR / "ui_webview"            # the app window's own storage (cache, the viewer's volumes)
 IDLE_EXIT_S = 180            # no ping from the window for this long: the window was closed
 TREND_MIN_OBJECTS = 150      # objects of a category each half of the recent plays needs for a trend
 
@@ -290,14 +289,44 @@ def accuracy(h: dict) -> float:
     return (300 * h["c300"] + 100 * h["c100"] + 50 * h["c50"]) / (300 * total) if total else 0.0
 
 
+REPLAY_STATS_LOCK = threading.Lock()
+
+
+def read_replay_stats() -> dict:
+    try:
+        return json.loads(REPLAY_STATS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_combo_breaks(counts: dict[str, dict]):
+    """Keep the slider breaks and dropped slider ends of some replays (id -> {"sb", "se"}) with their header counts."""
+    with REPLAY_STATS_LOCK:
+        cache = read_replay_stats()
+        for key, n in counts.items():
+            if key in cache:
+                cache[key].update(n)
+        REPLAY_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        REPLAY_STATS_PATH.write_text(json.dumps(cache), encoding="utf-8")
+
+
+def combo_breaks(results) -> dict:
+    """Why a play with no miss isn't a full combo. sb: combo breaks that aren't misses, slider heads missed on
+    sliders that still scored and dropped ticks or repeats (the "Break" rows of the replay page's mistake list);
+    se: dropped slider ends, which keep the combo but miss its +1, so the play isn't a full combo either."""
+    from .beatmap import SLIDER
+    sliders = [r for r in results if r.played and r.obj.kind == SLIDER]
+    return {"sb": sum(1 for r in sliders if r.head_result == 0 and r.result != 0
+                      or r.head_result != 0 and r.slider_break_kind in ("tick", "repeat")),
+            "se": sum(1 for r in sliders if r.head_result != 0 and r.slider_break_kind == "end")}
+
+
 def replay_rows(settings: dict) -> dict:
     from .mods import mods_string
     from .recommend import _star_key
     st = STATE.load(settings)
-    try:
-        cache = json.loads(REPLAY_STATS_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        cache = {}
+    with REPLAY_STATS_LOCK:
+        cache = read_replay_stats()
     rows, changed = [], False
     entries = [("r", e.name, st.replays.path(e), e) for e in st.replays.entries.values() if e.mode == 0]
     if IMPORTED_DIR.exists():
@@ -324,12 +353,17 @@ def replay_rows(settings: dict) -> dict:
             "supported": not h["mods"] & (128 | 8192),     # Relax / Autopilot can't be analysed
             "stars": (m.stars.get(_star_key(h["mods"])) or m.stars.get(0)) if m else None,
             "mods": mods_string(h["mods"]), "combo": h["combo"], "max_combo": None, "acc": accuracy(h),
-            "miss": h["miss"], "c100": h["c100"], "c50": h["c50"], "perfect": h["perfect"],
+            "miss": h["miss"], "c100": h["c100"], "c50": h["c50"], "perfect": h["perfect"], "sb": h.get("sb"), "se": h.get("se"),
             "beatmap_id": m.beatmap_id if m and m.beatmap_id > 0 else None,
         })
     if changed:
-        REPLAY_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        REPLAY_STATS_PATH.write_text(json.dumps(cache), encoding="utf-8")
+        with REPLAY_STATS_LOCK:
+            fresh = read_replay_stats()   # keep combo breaks counted meanwhile
+            for key, h in cache.items():
+                if "sb" not in h and "se" in fresh.get(key, {}) and fresh[key].get("mtime") == h.get("mtime"):
+                    h["sb"], h["se"] = fresh[key]["sb"], fresh[key]["se"]
+            REPLAY_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            REPLAY_STATS_PATH.write_text(json.dumps(cache), encoding="utf-8")
     rows.sort(key=lambda r: -r["time"])
     return {"owner": st.replays.owner, "replays": rows}
 
@@ -343,6 +377,29 @@ def replay_path(replay_id: str) -> Path:
     if not path.exists():
         raise UserError(f"replay not found: {name}")
     return path
+
+
+def count_combo_breaks(job: Job, settings: dict, ids: list[str]) -> dict:
+    """Slider breaks and ends of replays with no miss that aren't a full combo, for the replay list: judged one by one,
+    each count shown (job.partial) and saved as it comes."""
+    from .beatmap import parse_beatmap
+    from .judge import judge
+    from .replay import parse_replay
+    st = STATE.load(settings)
+    job.partial = {}
+    for n, replay_id in enumerate(ids):
+        job.step("Counting slider breaks", n, len(ids))
+        try:
+            replay = parse_replay(replay_path(replay_id))
+            map_path = st.index.find(replay.beatmap_md5)
+            if map_path is None or replay.mode != 0 or replay.mods & (128 | 8192):
+                continue
+            results, _ = judge(replay, parse_beatmap(map_path))
+        except Exception:   # a replay or map that can't be read: no count
+            continue
+        job.partial[replay_id] = combo_breaks(results)
+        save_combo_breaks({replay_id: job.partial[replay_id]})
+    return job.partial
 
 
 # --- judging many plays, with progress ----------------------------------------------------------------------
@@ -559,6 +616,7 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
     beatmap = parse_beatmap(map_path)
     job.step("Simulating the play")
     results, diff = judge(replay, beatmap)
+    save_combo_breaks({replay_id: combo_breaks(results)})   # for the replay list
     rate = clock_rate(replay.mods)
     s = summarize(results, diff.radius, rate)
     feats = extract(results, diff, rate, beatmap)
@@ -613,7 +671,8 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
                   "combo": replay.max_combo, "acc": accuracy({"c300": replay.count_300, "c100": replay.count_100,
                                                               "c50": replay.count_50, "miss": replay.count_miss}),
                   "ur": s.unstable_rate, "mean_error": s.mean_error, "early": s.mean_early, "late": s.mean_late,
-                  "aim_distance": s.aim_mean_distance, "slider_breaks": s.slider_breaks},
+                  "aim_distance": s.aim_mean_distance, "slider_breaks": s.slider_breaks,
+                  **combo_breaks(results)},
         "habit_plays": used,
         "priorities": [{
             "category": p.category, "name": p.name, "map_score": p.map_score, "habits_score": p.habits_score,
@@ -1430,6 +1489,8 @@ class Handler(BaseHTTPRequestHandler):
         if route == "search":
             work = recommend_maps if body.get("recommended") else search_maps
             return start_job("search", lambda job: work(job, settings, body)).public()
+        if route == "combo-breaks":
+            return start_job("combo-breaks", lambda job: count_combo_breaks(job, settings, body["ids"])).public()
         if route == "download":
             return start_job("download", lambda job: download_sets(job, settings, body["sets"])).public()
         if route.startswith("job/") and route.endswith("/cancel"):
@@ -1519,8 +1580,12 @@ def pick_folder_here(out_path: str):
 
 
 def pick_folder() -> str:
-    """A native folder picker (tkinter), run in its own process so it never fights the server's threads: this
-    Python again, or the packaged app (osu-coach.exe --pick-folder)."""
+    """A native folder picker: the app window's own; without it tkinter, run in its own process so it never fights
+    the server's threads (this Python again, or the packaged app: osu-coach.exe --pick-folder)."""
+    if WINDOW:
+        import webview
+        picked = WINDOW[0].create_file_dialog(webview.FOLDER_DIALOG)
+        return picked[0] if picked else ""
     import tempfile
     fd, out_path = tempfile.mkstemp(suffix=".txt")
     os.close(fd)
@@ -1539,14 +1604,37 @@ def pick_folder() -> str:
 
 # --- the window ---------------------------------------------------------------------------------------------------
 
-def _app_browser() -> str | None:
-    roots = [os.environ.get(k) for k in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA")]
-    for root in filter(None, roots):
-        for rel in (r"Microsoft\Edge\Application\msedge.exe", r"Google\Chrome\Application\chrome.exe"):
-            p = Path(root) / rel
-            if p.exists():
-                return str(p)
-    return shutil.which("msedge") or shutil.which("chrome")
+WINDOW: list = []     # the app window (pywebview), once open
+
+
+def open_window(url: str) -> bool:
+    """The app's own window (pywebview: the system's web view, WebView2 on Windows), until it is closed. False when
+    pywebview can't open one: the page then opens in the default browser."""
+    try:
+        import webview
+    except ImportError:
+        return False
+    width, height = 1440, 920
+    try:   # not larger than the screen
+        screen = webview.screens[0]
+        width, height = min(width, int(screen.width * .92)), min(height, int(screen.height * .88))
+    except Exception:
+        pass
+    if sys.platform == "win32":   # the app's own taskbar button, with the window's icon (not python's)
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("osucoach.app")
+        except (AttributeError, OSError):
+            pass
+    try:
+        WINDOW.append(webview.create_window("osu!coach", url, width=width, height=height, min_size=(1000, 640),
+                                            background_color="#120d17", text_select=True))
+        webview.start(private_mode=False, storage_path=str(WEBVIEW_STORAGE), icon=str(UI_DIR / "icon.ico"))
+    except Exception:
+        traceback.print_exc()
+        WINDOW.clear()
+        return False
+    return True
 
 
 def main():
@@ -1559,15 +1647,12 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", int(os.environ.get("OSU_COACH_PORT") or 0)), Handler)
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    browser = _app_browser()
-    if os.environ.get("OSU_COACH_NO_WINDOW"):
-        pass
-    elif browser:
-        subprocess.Popen([browser, f"--app={url}", f"--user-data-dir={BROWSER_PROFILE}", "--window-size=1440,920",
-                          "--no-first-run", "--no-default-browser-check"])
-    else:
-        webbrowser.open(url)
     print(f"osu-coach: {url}  (stops by itself when the window is closed)")
+    if not os.environ.get("OSU_COACH_NO_WINDOW"):
+        if open_window(url):    # returns when the window is closed
+            server.shutdown()
+            return
+        webbrowser.open(url)
     LAST_PING[0] = time.time() + 60     # time to open the window
     try:
         while time.time() - LAST_PING[0] < IDLE_EXIT_S:

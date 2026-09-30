@@ -165,6 +165,7 @@ const BUILDERS = { profile: buildProfile, skills: buildSkills, improvement: buil
   search: buildSearch, settings: buildSettings, setup: buildSetup };
 
 function show(page) {
+  if (S.navLocked && page !== S.current) return;
   S.current = page;
   document.querySelectorAll(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page === page));
   for (const [name, el] of Object.entries(S.pages)) el.classList.toggle("hidden", name !== page);
@@ -281,8 +282,19 @@ function trendTable(trends) {
 }
 
 /** Recomputing the profile feeds both the Profile and the Skills pages. */
+/** While the profile is computed the other pages wait: they show what it produces. */
+function lockNav(on) {
+  S.navLocked = on;
+  document.querySelectorAll(".nav-item").forEach(b => {
+    const lock = on && b.dataset.page !== S.current;
+    b.disabled = lock;
+    b.title = lock ? "Available when the profile has been computed" : "";
+  });
+}
+
 async function recomputeProfile(btn, prog) {
   btn.disabled = true;
+  lockNav(true);
   const box = progressBox("Getting ready…");
   put(prog, box.el);
   try {
@@ -295,6 +307,7 @@ async function recomputeProfile(btn, prog) {
   } finally {
     put(prog);
     btn.disabled = false;
+    lockNav(false);
   }
 }
 
@@ -644,10 +657,54 @@ function buildReplays(root) {
       R.owner = d.owner;
       player.options[0].textContent = d.owner ? `${d.owner}'s plays` : "My plays";
       filter();
+      countBreaks();
     } catch (e) {
       put(list, h("div.empty", e.message));
       count.textContent = "";
     }
+  }
+
+  /** No miss but no full combo: the slider breaks aren't in the replay's header, so the plays are judged in the
+      background (newest first) and each row shows its count as it comes. */
+  async function countBreaks() {
+    if (R.breaksJob) api(`job/${R.breaksJob}/cancel`, {}).catch(() => {});
+    const ids = R.rows.filter(r => !r.miss && !r.perfect && r.se == null && r.found && r.supported).map(r => r.id);
+    if (!ids.length) return;
+    const byId = new Map(R.rows.map(r => [r.id, r]));
+    const paint = counts => {
+      for (const [id, n] of Object.entries(counts || {})) {
+        const r = byId.get(id);
+        if (!r || r.se != null) continue;
+        Object.assign(r, n);
+        repaintRow(r);
+      }
+    };
+    try {
+      paint(await runJob("combo-breaks", { ids }, { attach: id => { R.breaksJob = id; }, update: j => paint(j.partial) }));
+    } catch { }
+  }
+
+  function repaintRow(r) {
+    const old = list.querySelector(`.rp[data-id="${CSS.escape(r.id)}"]`);
+    if (old) old.replaceWith(rowEl(r));
+    if (R.selected?.id === r.id && !R.viewer && R.selected.header) put(R.selected.header, playResult(r));
+  }
+
+  /** Misses, or FC, or for a play with no miss what kept it from a full combo: slider breaks (SB) and dropped
+      slider ends (SE), once counted. */
+  function resultTag(r) {
+    if (r.miss) return h("span.x", `${r.miss}✕`);
+    if (r.perfect) return h("span.fc", "FC");
+    const parts = [r.sb ? `${r.sb} SB` : null, r.se ? `${r.se} SE` : null].filter(Boolean);
+    return h("span.sb", { title: "No miss, but not a full combo. SB: slider breaks (combo lost); SE: slider ends missed (no combo break, but not FC)" },
+      parts.length ? parts.join(" ") : "not FC");
+  }
+
+  function playResult(r) {
+    if (r.miss || r.perfect)
+      return h("div.stat", h("b", { style: { color: r.miss ? "var(--miss)" : "var(--ok)" } }, r.miss || "FC"), h("span", "miss"));
+    return [h("div.stat", h("b", { style: { color: "var(--warn)" } }, r.sb ?? "…"), h("span", "slider breaks")),
+      r.se ? h("div.stat", h("b", { style: { color: "var(--warn)" } }, r.se), h("span", "slider ends missed")) : null];
   }
 
   function filter() {
@@ -675,8 +732,7 @@ function buildReplays(root) {
       h("div.name", r.map),
       h("div.meta",
         h("span", r.source === "i" ? "imported" : fmtDate(r.time)), modsChip(r.mods), r.stars ? starChip(r.stars) : null,
-        h("span.acc", pct(r.acc, 2)), h("span", `${r.combo}x`),
-        r.miss ? h("span.x", `${r.miss}✕`) : h("span.fc", "FC")));
+        h("span.acc", pct(r.acc, 2)), h("span", `${r.combo}x`), resultTag(r)));
     el.dataset.id = r.id;
     return el;
   }
@@ -693,7 +749,7 @@ function buildReplays(root) {
           h("div.stat-row", { style: { marginTop: "14px" } },
             h("div.stat", h("b", pct(r.acc, 2)), h("span", "accuracy")),
             h("div.stat", h("b", `${r.combo}x`), h("span", "combo")),
-            h("div.stat", h("b", { style: { color: r.miss ? "var(--miss)" : "var(--ok)" } }, r.miss || "FC"), h("span", "miss")),
+            r.header = h("div", { style: { display: "contents" } }, playResult(r)),
             h("div.stat", h("b", { style: { color: "var(--r100)" } }, r.c100), h("span", "100")),
             h("div.stat", h("b", { style: { color: "var(--r50)" } }, r.c50), h("span", "50")))),
         h("button.btn.primary.big", { disabled: !r.found || !r.supported, onclick: () => analyze(r) }, icon("play"), "Analyze replay")),
@@ -707,6 +763,7 @@ function buildReplays(root) {
     put(content, h("div.card", h("h2", r.map), box.el));
     try {
       const res = await runJob("analyze", { id: r.id }, box);
+      if (r.sb !== res.stats.sb || r.se !== res.stats.se) { r.sb = res.stats.sb; r.se = res.stats.se; repaintRow(r); }
       if (R.selected?.id === r.id) renderAnalysis(res);
     } catch (e) {
       put(content, h("div.card", emptyState("x", "Analysis failed", e.message,
@@ -727,6 +784,8 @@ function buildReplays(root) {
           h("div.stat", h("b", pct(s.acc, 2)), h("span", "accuracy")),
           h("div.stat", h("b", `${s.combo}x`), h("span", "max combo")),
           h("div.stat", h("div.hits", h("span.h300", s.c300), h("span.h100", s.c100), h("span.h50", s.c50), h("span.hmiss", s.miss)), h("span", "300 / 100 / 50 / miss")),
+          !s.miss && s.sb ? h("div.stat", h("b", { style: { color: "var(--warn)" } }, s.sb), h("span", "slider breaks")) : null,
+          !s.miss && s.se ? h("div.stat", h("b", { style: { color: "var(--warn)" } }, s.se), h("span", "slider ends missed")) : null,
           h("div.stat", h("b", num(s.ur, 0)), h("span", "UR")),
           h("div.stat", h("b", `${s.mean_error > 0 ? "+" : ""}${num(s.mean_error, 1)}ms`), h("span", s.mean_error < 0 ? "early on average" : "late on average")))),
       h("div.row", { style: { flexDirection: "column", alignItems: "stretch" } },
@@ -916,6 +975,36 @@ function seg(options, value, onChange, multi = false) {
   };
 }
 
+/** The mods to search with, picked as in osu!: they add up to one combination (HD + DT = HDDT); NM clears the others,
+    DT/HT and HR/EZ exclude each other. get() gives a one-item list (["HDDT"]), as the search expects. */
+const MOD_CODES = ["EZ", "HD", "HR", "DT", "HT"], MOD_CLASH = { DT: "HT", HT: "DT", HR: "EZ", EZ: "HR" };
+function modPicker(value) {
+  const el = h("div.seg");
+  let cur = new Set();
+  const buttons = ["NM", ...MOD_CODES].map(v => {
+    const b = h("button", { onclick: () => {
+      if (b.disabled) return;
+      if (v === "NM") cur.clear();
+      else if (cur.has(v)) cur.delete(v);
+      else { cur.add(v); cur.delete(MOD_CLASH[v]); }
+      paint();
+    } }, v);
+    b.dataset.v = v;
+    return b;
+  });
+  const paint = () => buttons.forEach(b => b.classList.toggle("on", b.dataset.v === "NM" ? !cur.size : cur.has(b.dataset.v)));
+  // older settings kept a list of separate mods (["NM", "DT"]): their mods are read as one combination
+  const set = v => {
+    cur = new Set();
+    for (const code of [].concat(v || []).join("").toUpperCase().match(/../g) || [])
+      if (MOD_CODES.includes(code)) { cur.add(code); cur.delete(MOD_CLASH[code]); }
+    paint();
+  };
+  el.append(...buttons);
+  set(value);
+  return { el, buttons, get: () => [MOD_CODES.filter(m => cur.has(m)).join("") || "NM"], set };
+}
+
 // where to search and which statuses: lists now (older settings kept one value)
 const toSources = v => Array.isArray(v) ? v : [v || "online"];
 const toStatuses = v => Array.isArray(v) ? v : v === "loved" ? ["ranked", "loved"] : v === "any" ? ["ranked", "loved", "other"] : ["ranked"];
@@ -947,31 +1036,29 @@ function buildSearch(root) {
     return t;
   });
 
-  // a share slider for each included (at least) or excluded (at most) skillset that has a share of the notes
+  // a share slider for each included skillset that has a share of the notes: at least this much of them
   const SHARED = ["jump", "stream", "alt", "finger control", "tech"];
-  const shares = { min: {}, max: {} };
+  const shares = { min: {} };
   const shareBox = h("div.share-sliders");
   function paintShares() {
-    put(shareBox, SHARED.filter(sk => skillState[sk]).map(sk => {
-      const inc = skillState[sk] === 1, bag = inc ? shares.min : shares.max;
-      const any = inc ? 0 : 100;
-      const input = h("input.slider-single", { type: "range", min: 0, max: 100, step: 5, value: bag[sk] ?? any });
+    put(shareBox, SHARED.filter(sk => skillState[sk] === 1).map(sk => {
+      const input = h("input.slider-single", { type: "range", min: 0, max: 100, step: 5, value: shares.min[sk] ?? 0 });
       const val = h("span.val");
       const show = () => {
         const v = +input.value;
-        bag[sk] = v;
-        val.textContent = v === any ? "any" : `${inc ? "at least" : "at most"} ${v}%`;
-        val.classList.toggle("any", v === any);
+        shares.min[sk] = v;
+        val.textContent = v === 0 ? "any" : `at least ${v}%`;
+        val.classList.toggle("any", v === 0);
       };
       input.addEventListener("input", show);
       show();
-      return h("div.share-slider", h("span", h("b", S.state.skill_names[sk] || sk), h("span.muted", inc ? " included" : " excluded")), input, val);
+      return h("div.share-slider", h("span", h("b", S.state.skill_names[sk] || sk), h("span.muted", " included")), input, val);
     }));
   }
   paintShares();
 
   const source = seg(SOURCE_OPTIONS, toSources(cfg.source), () => syncSource(), true);
-  const mods = seg([["NM", "NM"], ["DT", "DT"], ["HR", "HR"], ["HD", "HD"], ["EZ", "EZ"], ["HT", "HT"]], cfg.mods, null, true);
+  const mods = modPicker(cfg.mods);
   const status = seg(STATUS_OPTIONS, toStatuses(cfg.status), null, true);
   const unplayed = h("label.check", h("input", { type: "checkbox", checked: cfg.unplayed }), "Only maps never played");
   const limit = h("input.input.num", { type: "number", min: 1, max: 1000, value: cfg.limit });
@@ -987,10 +1074,7 @@ function buildSearch(root) {
       b.disabled = !songs && !["NM", "DT"].includes(b.dataset.v);
       b.style.opacity = b.disabled ? .35 : "";
     });
-    if (!songs) {
-      const siteMods = mods.get().filter(m => m === "NM" || m === "DT");
-      mods.set(siteMods.length ? siteMods : ["NM"]);
-    }
+    if (!songs) mods.set(mods.get()[0].includes("DT") ? ["DT"] : ["NM"]);
     unplayed.classList.toggle("hidden", !songs || recOn);
     status.buttons[2].classList.toggle("hidden", !songs);
     if (!songs && status.get().includes("other")) status.set(status.get().filter(x => x !== "other").length ? status.get().filter(x => x !== "other") : ["ranked"]);
@@ -1031,14 +1115,15 @@ function buildSearch(root) {
     h("div.row", h("label.row", limitLabel, limit), depth, h("div.grow"),
       h("button.btn.ghost", { onclick: () => reset() }, "Reset"), goBtn));
   const prog = h("div", { style: { marginTop: "16px" } });
+  const dlProg = h("div", { style: { marginTop: "16px" } });
   const results = h("div.section");
-  page.append(panel, prog, results);
+  page.append(panel, prog, dlProg, results);
 
   function reset() {
     Object.keys(skillState).forEach(k => skillState[k] = 0);
     toggles.forEach(t => t.paint());
     text.value = "";
-    shares.min = {}; shares.max = {};
+    shares.min = {};
     paintShares();
     ranges.forEach(r => r.set(null));
     mods.set(cfg.mods); status.set(toStatuses(cfg.status)); source.set(toSources(cfg.source)); syncSource();
@@ -1064,7 +1149,6 @@ function buildSearch(root) {
       include: Object.keys(skillState).filter(k => skillState[k] === 1),
       exclude: Object.keys(skillState).filter(k => skillState[k] === 2),
       min_share: Object.fromEntries(Object.entries(shares.min).filter(([k, v]) => skillState[k] === 1 && v > 0)),
-      max_share: Object.fromEntries(Object.entries(shares.max).filter(([k, v]) => skillState[k] === 2 && v < 100)),
       source: source.get(), mods: mods.get(), status: status.get(),
       unplayed: unplayed.querySelector("input").checked, limit: +limit.value || 30, text: text.value.trim(),
       recommended: recommended.checked,
@@ -1073,7 +1157,7 @@ function buildSearch(root) {
     const box = progressBox("Searching…");
     put(prog, box.el);
     put(results);
-    shown = { keys: [], grid: null, title: null, count: null };
+    shown = { keys: [], grid: null, title: null, count: null, partial: true, maps: [] };
     try {
       const res = await runJob("search", q, box, partial => renderResults({ maps: partial, total: partial.length, note: "" }, true));
       renderResults(res, false);
@@ -1085,26 +1169,28 @@ function buildSearch(root) {
     }
   }
 
-  const downloaded = new Set();
+  // downloads: one queue for the whole page (a map's own button and "Download all" add to it), one set at a time
+  const downloaded = new Set(), queued = new Set(), cleared = new Set(), dlQueue = [];
+  let dlRunning = false, dlStopped = false, dlCount = { total: 0, seen: 0, ok: 0 }, dlFailed = [];
   let last = { maps: [], note: "" };
   const cardKey = m => `${m.beatmap_id}:${m.mods}:${m.name}`;
-  let shown = { keys: [], grid: null, title: null, count: null };
+  let shown = { keys: [], grid: null, title: null, count: null, partial: false, maps: [] };
+  const pendingSets = maps => [...new Map(maps.filter(m => !m.local && m.set_id && !downloaded.has(m.set_id) && !queued.has(m.set_id))
+    .map(m => [m.set_id, m])).values()];
 
   function renderResults(res, partial, force = false) {
     if (!partial) last = res;
-    const maps = res.maps, keys = maps.map(cardKey);
+    const maps = res.maps.filter(m => !cleared.has(m.set_id)), keys = maps.map(cardKey);
     // while the search runs, the maps found so far keep their cards (redrawing them under the mouse would flicker)
     if (!force && shown.grid && shown.keys.length <= keys.length && shown.keys.every((k, i) => k === keys[i])
         && (partial || shown.keys.length === keys.length)) {
       shown.grid.append(...maps.slice(shown.keys.length).map(mapCard));
-      shown.keys = keys;
+      Object.assign(shown, { keys, maps, partial });
       shown.title.textContent = `${maps.length} maps`;
       shown.count.textContent = partial ? "searching…" : res.note || "";
+      paintDownloadButtons();
       if (partial) return;
     }
-    const toDownload = [...new Map(maps.filter(m => !m.local && m.set_id && !downloaded.has(m.set_id)).map(m => [m.set_id, m])).values()];
-    const allBtn = h("button.btn.primary", { disabled: partial || !toDownload.length, onclick: () => download(toDownload, allBtn) },
-      icon("download"), `Download all (${toDownload.length})`);
     let grid = maps.length ? h("div.results", maps.map(mapCard)) : null;
     if (res.recommended && maps.length) {   // one ladder per skillset, easiest first
       const groups = [...new Set(maps.map(m => m.group))];
@@ -1112,21 +1198,53 @@ function buildSearch(root) {
       force = true;
     }
     const title = h("h2", `${maps.length} maps`), count = h("span.count", partial ? "searching…" : res.note || "");
-    shown = { keys, grid, title, count };
+    const allBtn = h("button.btn.primary", { onclick: () => enqueue(pendingSets(shown.maps)) }, icon("download"), h("span"));
+    const clearBtn = h("button.btn.ghost", { title: "Remove the downloaded maps from these results", onclick: clearDownloaded },
+      icon("x"), h("span"));
+    shown = { keys, grid, title, count, partial, maps, allBtn, clearBtn };
     put(results,
       h("div.section-title", title, count, h("div.grow"),
         maps.some(m => m.local) ? h("button.btn.ghost", { onclick: () => api("open", { url: "songs" }) }, icon("folder"), "Open Songs") : null,
-        toDownload.length ? allBtn : null),
+        clearBtn, allBtn),
       grid || (partial ? null : h("div.card", emptyState("search", "No maps found", "Widen the filters or drop a skillset."))));
+    paintDownloadButtons();
+  }
+
+  /** "Download all (n)" and "Clear downloaded (n)" follow the queue as it goes. */
+  function paintDownloadButtons() {
+    const { allBtn, clearBtn, maps, partial } = shown;
+    if (!allBtn) return;
+    const left = pendingSets(maps).length, done = new Set(maps.filter(m => downloaded.has(m.set_id)).map(m => m.set_id)).size;
+    allBtn.lastChild.textContent = `Download all (${left})`;
+    allBtn.disabled = partial || !left;
+    allBtn.classList.toggle("hidden", !left);
+    clearBtn.lastChild.textContent = `Clear downloaded (${done})`;
+    clearBtn.classList.toggle("hidden", !done);
+  }
+
+  /** Take the downloaded maps out of the results. */
+  function clearDownloaded() {
+    downloaded.forEach(id => cleared.add(id));
+    renderResults(shown.partial ? { maps: shown.maps, note: "" } : last, shown.partial, true);
+  }
+
+  function dlSlot(m) {
+    return m.local ? h("span.chip.green", "in Songs")
+      : downloaded.has(m.set_id) ? h("span.chip.green", "downloaded ✓")
+      : queued.has(m.set_id) ? h("span.chip", dlQueue.some(x => x.set_id === m.set_id) ? "queued…" : "downloading…")
+      : h("button.btn.sm", { onclick: e => { e.stopPropagation(); enqueue([m]); } }, icon("download"), "Download");
+  }
+
+  /** Redraw the download badge of every card of a beatmapset. */
+  function paintSet(setId) {
+    results.querySelectorAll(`.map-card[data-set="${setId}"]`).forEach(card => put(card.querySelector(".dl-slot"), dlSlot(card.map)));
   }
 
   function mapCard(m) {
-    const dl = m.local ? h("span.chip.green", "in Songs")
-      : downloaded.has(m.set_id) ? h("span.chip.green", "downloaded ✓")
-      : h("button.btn.sm", { onclick: e => { e.stopPropagation(); download([m], e.currentTarget); } }, icon("download"), "Download");
-    return h("div.card.map-card", { title: "Open the map's page", onclick: () => m.beatmap_id && openOsu(`https://osu.ppy.sh/b/${m.beatmap_id}`) },
+    const card = h("div.card.map-card", { title: "Open the map's page", onclick: () => m.beatmap_id && openOsu(`https://osu.ppy.sh/b/${m.beatmap_id}`) },
       h("div.cover", { style: m.set_id ? { backgroundImage: `url(https://assets.ppy.sh/beatmaps/${m.set_id}/covers/card.jpg)` } : {} },
-        h("div.badges", m.step ? h("span.chip.step-chip", `#${m.step}`) : null, starChip(m.stars), modsChip(m.mods), h("div.grow"), dl)),
+        h("div.badges", m.step ? h("span.chip.step-chip", `#${m.step}`) : null, starChip(m.stars), modsChip(m.mods), h("div.grow"),
+          h("span.dl-slot", dlSlot(m)))),
       h("div.body",
         h("div", h("div.title", m.title), h("div.sub", `${m.artist} · [${m.version}] by ${m.creator}`)),
         h("div.vals",
@@ -1135,24 +1253,54 @@ function buildSearch(root) {
         h("div.tags", m.tags.map(t => h("span.chip.pink", S.state.skill_names[t] || t))),
         h("div.label", m.label),
         m.why ? h("div.why", m.why) : null));
+    card.dataset.set = m.set_id || "";
+    card.map = m;
+    return card;
   }
 
-  async function download(list, btn) {
-    const box = progressBox(`Downloading ${list.length} maps…`);
-    put(prog, box.el);
-    if (btn) btn.disabled = true;
-    try {
-      const res = await runJob("download", { sets: list.map(m => ({ set_id: m.set_id, artist: m.artist, title: m.title })) }, box);
-      res.done.forEach(id => downloaded.add(id));
-      if (res.failed.length) toast(`${res.failed.length} not downloaded: ${res.failed.map(f => f.error).join("; ")}`, true);
-      if (res.done.length) toast(`${res.done.length} maps saved to Songs: press F5 in osu!'s song select to import them.`);
-      renderResults(last, false, true);
-    } catch (e) {
-      toast(e.message, true);
-      if (btn) btn.disabled = false;
-    } finally {
-      put(prog);
+  function enqueue(list) {
+    for (const m of list) {
+      if (!m.set_id || m.local || downloaded.has(m.set_id) || queued.has(m.set_id)) continue;
+      queued.add(m.set_id);
+      dlQueue.push(m);
+      dlCount.total++;
+      paintSet(m.set_id);
     }
+    paintDownloadButtons();
+    if (!dlRunning) runQueue();
+  }
+
+  async function runQueue() {
+    dlRunning = true; dlStopped = false;
+    const box = progressBox("Downloading…");
+    box.el.querySelector("button").addEventListener("click", () => { dlStopped = true; });   // Stop: the whole queue
+    put(dlProg, box.el);
+    while (dlQueue.length && !dlStopped) {
+      const m = dlQueue.shift();
+      paintSet(m.set_id);   // queued -> downloading
+      const label = `Downloading ${m.artist} - ${m.title}`;
+      const show = () => box.update({ label, total: dlCount.total, done: dlCount.seen });
+      show();
+      try {
+        const res = await runJob("download", { sets: [{ set_id: m.set_id, artist: m.artist, title: m.title }] },
+          { attach: id => box.attach(id), update: show });
+        if (res.done.length) { downloaded.add(m.set_id); dlCount.ok++; }
+        else dlFailed.push(`${m.title}: ${res.failed[0]?.error || "failed"}`);
+      } catch (e) {
+        if (!dlStopped) dlFailed.push(`${m.title}: ${e.message}`);
+      }
+      dlCount.seen++;
+      queued.delete(m.set_id);
+      paintSet(m.set_id);
+      paintDownloadButtons();
+    }
+    for (const m of dlQueue.splice(0)) { queued.delete(m.set_id); paintSet(m.set_id); }   // stopped: the rest isn't downloaded
+    if (dlFailed.length) toast(`${dlFailed.length} not downloaded: ${dlFailed.join("; ")}`, true);
+    if (dlCount.ok) toast(`${dlCount.ok} maps saved to Songs: press F5 in osu!'s song select to import them.`);
+    dlCount = { total: 0, seen: 0, ok: 0 }; dlFailed = [];
+    put(dlProg);
+    dlRunning = false;
+    paintDownloadButtons();
   }
 }
 
@@ -1408,7 +1556,7 @@ function buildSettings(root) {
   // search defaults
   const sc = cfg.search;
   const sSource = seg([["online", "On the osu! site"], ["songs", "Songs folder"]], toSources(sc.source), null, true);
-  const sMods = seg([["NM", "NM"], ["DT", "DT"], ["HR", "HR"], ["HD", "HD"], ["EZ", "EZ"], ["HT", "HT"]], sc.mods, null, true);
+  const sMods = modPicker(sc.mods);
   const sStatus = seg(STATUS_OPTIONS, toStatuses(sc.status), null, true);
   const sUnplayed = h("input", { type: "checkbox", checked: sc.unplayed });
   const sLimit = h("input.input.num", { type: "number", min: 1, value: sc.limit });

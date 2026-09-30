@@ -286,7 +286,8 @@
       const speedLbl = el("span", "speed-val", "1x");
       const ticks = el("div", "speed-ticks");
       for (const v of SPEEDS) ticks.appendChild(el("span", "", `${v}`));
-      range.addEventListener("input", () => { this.speed = SPEEDS[+range.value]; speedLbl.textContent = `${this.speed}x`; });
+      range.addEventListener("input", () => this.setSpeed(SPEEDS[+range.value]));
+      this.speedRange = range; this.speedLbl = speedLbl;
       speeds.append(el("div", "speed-track"), speedLbl);
       speeds.firstChild.append(range, ticks);
       this.loopChk = el("label", "check small hidden", `<input type="checkbox" checked> loop section`);
@@ -384,8 +385,15 @@
     /** Music offset in ms from Settings (opts.musicOffset, read live): positive = the song earlier. */
     get musicOffset() { return clamp(+(this.opts.musicOffset?.() ?? 0) || 0, -100, 100); }
 
-    /** Play a section from a little before it, looping it until the timeline is used. */
+    setSpeed(v) {
+      this.speed = v;
+      this.speedRange.value = SPEEDS.indexOf(v);
+      this.speedLbl.textContent = `${v}x`;
+    }
+
+    /** Play a section from a little before it at half speed, looping it until the timeline is used. */
     focus(start, end) {
+      this.setSpeed(0.5);
       this.loop = [Math.max(this.start, start), Math.min(this.end, end)];
       this.syncLoop();
       this.seek(this.loop[0]);

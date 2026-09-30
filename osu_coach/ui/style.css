@@ -73,6 +73,7 @@ a:hover { text-decoration: underline; }
 .nav-item svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
 .nav-item:hover { background: var(--surface-2); color: var(--text); }
 .nav-item.active { background: var(--pink-soft); color: var(--pink-2); box-shadow: inset 3px 0 0 var(--pink); }
+.nav-item:disabled { opacity: .35; cursor: not-allowed; background: transparent; color: var(--text-2); }
 .nav-spacer { flex: 1; }
 
 /* --- page --- */
@@ -281,6 +282,7 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .rp .meta .acc { color: var(--text); font-family: var(--mono); }
 .rp .meta .x { color: #ff8095; font-family: var(--mono); }
 .rp .meta .fc { color: var(--ok); font-weight: 700; }
+.rp .meta .sb { color: var(--warn); font-family: var(--mono); font-weight: 700; }
 .rp.missing { opacity: .55; }
 .replay-main { overflow: auto; min-width: 0; }
 .replay-main .page { max-width: 1250px; }
