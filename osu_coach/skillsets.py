@@ -3,7 +3,7 @@
 - streams: per length range, from 160 BPM: the comfortable BPM (the best BPM^0.9 / UR), the lowest BPM whose UR
   is within STREAM_UR_TOLERANCE of the comfortable one, and the highest BPM whose streams are still finished (half
   of them cleared, whatever the UR); minimum <= comfort <= maximum
-- alt: UR per 10 BPM on truly alternated runs, 120 to 170 BPM
+- alt: UR per 10 BPM on alt runs (maptypes._run_kind), 130 to 180 BPM
 - finger control: miss rate and UR for doubles, triples, quadruples and bursts up to 9 notes
 - jumps: mean click distance from the circle centre per distance range, and the highest BPM played cleanly
 - flow aim: misses due to aim per spacing range
@@ -29,7 +29,7 @@ STREAM_CLEARED = 0.5         # the highest BPM whose streams are finished this o
 MIN_BIN_HITS = 60            # hit notes a 10-BPM bin needs for its UR
 MIN_BIN_RUNS = 5             # runs a 10-BPM bin needs for its clear rate
 MIN_UR_PLAYS = 3             # ...and plays for its UR (one map shouldn't make a speed look easy or hard)
-ALT_BPM = (120, 170)
+ALT_BPM = (130, 180)
 FINGER_COUNTS = range(2, 10)
 FINGER_NAMES = {2: "doubles", 3: "triples", 4: "quadruples"}
 JUMP_RANGES = ((3.0, 6.0, "small jumps"), (6.0, 8.0, "normal jumps"), (8.0, None, "large jumps"))
@@ -204,6 +204,37 @@ def sliders(samples: list[Sample]) -> dict:
                      "tick_miss": sum(s.r.slider_break_kind in ("tick", "repeat") for s in held) / len(held) if held else None,
                      "end_miss": sum(s.r.slider_break_kind == "end" for s in held) / len(held) if held else None})
     return {"rows": rows}
+
+
+# the Trend of the Profile: the same skillsets, each note counted in every one it belongs to
+TREND_SKILLS = (("streams", "Streams"), ("alt", "Alt"), ("jumps", "Jumps"), ("sliders", "Sliders"),
+                ("flow", "Flow aim"), ("finger", "Finger control"))
+
+
+def trend_skills(s: Sample) -> list[str]:
+    """The skillsets a note counts for, as the Skills page picks its notes."""
+    from .maptypes import _run_kind
+    out = []
+    f = s.f
+    if f.pattern in STREAM_FAMILY:
+        if f.run_length >= STREAM_LENGTHS[0][0]:
+            out.append("streams")
+        elif f.run_length >= FINGER_COUNTS[0]:
+            out.append("finger")
+    if f.bpm and _run_kind(f) == "alt" and _in(f.bpm, *ALT_BPM):
+        out.append("alt")
+    if _aimed(s) and f.distance_radii >= JUMP_RANGES[0][0] and 0 < f.gap_ms <= JUMP_MAX_GAP_MS:
+        out.append("jumps")
+    if _aimed(s) and _in(f.distance_radii, FLOW_RANGES[0][0], FLOW_RANGES[-1][1]) and 0 < f.gap_ms <= FLOW_MAX_GAP_MS:
+        out.append("flow")
+    if s.r.obj.kind == SLIDER:
+        out.append("sliders")
+    return out
+
+
+def trend_missed(s: Sample, skill: str) -> bool:
+    """A miss for the trend: on sliders a dropped tick or repeat too (a break, like a miss)."""
+    return s.missed or skill == "sliders" and s.r.slider_break_kind in ("tick", "repeat")
 
 
 def build(samples: list[Sample], stream_ur_tolerance: float = STREAM_UR_TOLERANCE) -> dict:

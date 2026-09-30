@@ -235,11 +235,15 @@ function habitGroup(group, n, maxImpact, plays) {
   const [top, ...rest] = group.items;
   const isAcc = group.items.every(x => x.kind === "accuracy");
   const impact = isAcc ? "affects accuracy" : `~${Math.round(group.impact)} misses in ${plays} plays`;
-  return h("div.habit",
-    h("div.rank" + (isAcc ? ".acc" : ""), n),
-    h("div",
-      h("div.top", h("span.chip" + (isAcc ? ".warn" : ".pink"), CAT_NAMES[group.category] || group.category), h("h3", top.title)),
-      h("div.impact", h("div.meter", h("div.com", { style: { width: `${Math.max(3, group.impact / maxImpact * 100)}%` } })), h("span", impact)),
+  // a drop-down: the headline and its cost, the explanation and the fix when opened
+  return h("details.habit",
+    h("summary",
+      h("div.rank" + (isAcc ? ".acc" : ""), n),
+      h("span.chip" + (isAcc ? ".warn" : ".pink"), CAT_NAMES[group.category] || group.category),
+      h("h3.grow", top.title),
+      h("div.impact", h("span", impact), h("div.meter", h("div.com", { style: { width: `${Math.max(3, group.impact / maxImpact * 100)}%` } }))),
+      h("span.chev", { html: ICON.chev })),
+    h("div.body",
       h("p.detail", top.detail),
       rest.length ? h("ul.also", rest.map(x => h("li", h("b", x.title + ". "), x.detail))) : null,
       top.solution ? h("div.solution", h("span", { html: ICON.bulb }), h("div", h("b", "Fix: "), top.solution)) : null));
@@ -269,10 +273,11 @@ function trendTable(trends) {
   return h("table.trend-table",
     h("thead", h("tr", h("th", "Category"), h("th", "Older plays"), h("th", "Newer plays"), h("th", ""))),
     h("tbody", trends.map(t => h("tr",
-      h("td", CAT_NAMES[t.category] || t.name),
-      h("td.mono", pct(t.old) + " misses"),
-      h("td.mono", pct(t.new) + " misses"),
-      h("td", t.trend === "worse" ? h("span.chip.red", "▲ worse") : t.trend === "better" ? h("span.chip.green", "▼ better") : h("span.chip", "steady"))))));
+      h("td", t.name || CAT_NAMES[t.category]),
+      h("td.mono", t.old == null ? "—" : pct(t.old) + " misses"),
+      h("td.mono", t.new == null ? "—" : pct(t.new) + " misses"),
+      h("td", t.trend === "worse" ? h("span.chip.red", "▲ worse") : t.trend === "better" ? h("span.chip.green", "▼ better")
+        : t.trend === "none" ? h("span.small.muted", "not enough notes") : h("span.chip", "steady"))))));
 }
 
 /** Recomputing the profile feeds both the Profile and the Skills pages. */
@@ -468,17 +473,35 @@ const svg = (tag, attrs = {}) => { const e = document.createElementNS(SVGNS, tag
 const shortDate = d => new Date(d + "T12:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 
 /** One skillset's rating over the days: a line on the shared scale, the 1200 reference, a hover crosshair. */
-function eloChart(dates, values, plays, lo, hi) {
+const ELO_MIN_PAD = 50;   // rating points a chart shows at least below its lowest and above its highest rating
+const ELO_GRID = 50;      // a grid line every this many rating points
+
+function eloChart(dates, values, plays) {
   const W = 420, H = 150, L = 40, R = 10, T = 10, B = 24;
+  // the chart's own scale, around its values: the lowest and highest rating of the period, with some room
+  const known = values.filter(v => v != null);
+  const vmin = known.length ? Math.min(...known) : 1200, vmax = known.length ? Math.max(...known) : 1200;
+  const pad = Math.max(ELO_MIN_PAD, (vmax - vmin) * .15);
+  const lo = vmin - pad, hi = vmax + pad;
   const x = i => L + i / Math.max(1, dates.length - 1) * (W - L - R);
   const y = v => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
   const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "elo-chart", role: "img" });
-  // recessive grid: three values on the shared scale, and the reference
-  for (const v of [lo, 1200, hi]) {
-    root.append(svg("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), class: "grid" }));
-    const t = svg("text", { x: L - 6, y: y(v) + 4, class: "axis", "text-anchor": "end" }); t.textContent = v; root.append(t);
+  // dashed lines at the lowest and highest rating of the period
+  const apart = Math.max(0, 12 - (y(vmin) - y(vmax))) / 2;   // labels too close: pushed away from each other
+  const labels = [];
+  for (const [v, dy] of known.length ? (vmax > vmin ? [[vmin, apart], [vmax, -apart]] : [[vmin, 0]]) : []) {
+    root.append(svg("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), class: "ref" }));
+    const t = svg("text", { x: L - 6, y: y(v) + 4 + dy, class: "axis", "text-anchor": "end" }); t.textContent = Math.round(v); root.append(t);
+    labels.push(y(v) + dy);
   }
-  root.append(svg("line", { x1: L, x2: W - R, y1: y(1200), y2: y(1200), class: "ref" }));
+  // a faint line every 50 points, labelled where it doesn't crowd the other labels
+  for (let v = Math.ceil(lo / ELO_GRID) * ELO_GRID; v <= hi; v += ELO_GRID) {
+    root.prepend(svg("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), class: "grid" }));
+    if (labels.every(l => Math.abs(l - y(v)) >= 12)) {
+      const t = svg("text", { x: L - 6, y: y(v) + 4, class: "axis faint", "text-anchor": "end" }); t.textContent = v; root.append(t);
+      labels.push(y(v));
+    }
+  }
   for (const i of [0, Math.floor((dates.length - 1) / 2), dates.length - 1]) {
     const t = svg("text", { x: x(i), y: H - 6, class: "axis", "text-anchor": i === 0 ? "start" : i === dates.length - 1 ? "end" : "middle" });
     t.textContent = shortDate(dates[i]); root.append(t);
@@ -533,9 +556,7 @@ function buildImprovement(root) {
       return;
     }
     sub.textContent = `Your rating in each skillset at the end of every day, from ${e.plays} plays · updated ${fmtDate(e.updated)}. `
-      + "The dashed line is 1200, the reference player; +400 means ten times the odds of passing the same challenge.";
-    const all = Object.values(e.skills).flatMap(s => s.values).filter(v => v != null);
-    const lo = Math.floor((Math.min(1150, ...all) - 20) / 50) * 50, hi = Math.ceil((Math.max(1250, ...all) + 20) / 50) * 50;
+      + "The dashed lines are your lowest and highest rating of the period; 1200 is the reference player, and +400 means ten times the odds of passing the same challenge.";
     put(body, h("div.elo-grid", Object.entries(e.skills).map(([key, s]) => {
       const change = s.change == null ? null : Math.round(s.change);
       const trend = change == null ? h("span.chip", "no data")
@@ -543,7 +564,7 @@ function buildImprovement(root) {
         : change < 0 ? h("span.chip.red", `▼ ${change} in 90 days`) : h("span.chip", "unchanged");
       return h("div.card.elo-card",
         h("div.head", h("div", h("h3", s.label), trend), h("div.big-num", s.current ?? "—")),
-        eloChart(e.dates, s.values, e.plays_per_day, lo, hi));
+        eloChart(e.dates, s.values, e.plays_per_day));
     })),
       h("p.small.muted", { style: { marginTop: "14px" } },
         "Each play moves a rating by how many of its challenges you passed beyond what your rating expected (streams finished, jumps hit, "
@@ -718,7 +739,7 @@ function buildReplays(root) {
     for (const p of a.priorities) for (const e of p.episodes) sections.push({ start: e.time - 1200, end: e.time + 2200, label: `${CAT_NAMES[p.category] || p.name}: ${e.title}` });
     const vwrap = h("div", { style: { marginTop: "16px" } });
     content.append(vwrap);
-    R.viewer = new ReplayViewer(vwrap, a.viewer, { sections });
+    R.viewer = new ReplayViewer(vwrap, a.viewer, { sections, skin: loadSkin(), musicOffset: () => S.state.settings.viewer.offset });
     const focus = t => { R.viewer.focus(t - 1500, t + 2500); vwrap.scrollIntoView({ behavior: "smooth", block: "start" }); };
 
     // problems
@@ -989,8 +1010,6 @@ function buildSearch(root) {
     const on = recOn = recommended.checked;
     filterParts.forEach(el => el.classList.toggle("hidden", on));
     recHint.classList.toggle("hidden", !on);
-    limitLabel.textContent = on ? "Maps per skillset" : "Maximum number of maps";
-    if (on && +limit.value > 30) limit.value = 15;
     if (!on) syncSource();   // "only maps never played" follows the sources again
   }
   recommended.addEventListener("change", syncRecommended);
@@ -1306,6 +1325,12 @@ function sensSlider(label, hint, value, min, max, step, unit, onInput) {
   return { el: h("div.sens", h("label.field", label, input), val, h("div.hint", hint)), get: () => +input.value };
 }
 
+/** The player's osu! skin for the replay viewer, loaded once (again after the settings change). */
+function loadSkin() {
+  if (!S.skin) S.skin = api("skin").then(info => SkinAssets.load(info)).catch(e => { S.skin = null; throw e; });
+  return S.skin;
+}
+
 function buildSettings(root) {
   const st = S.state;
   const cfg = structuredClone(st.settings);
@@ -1423,6 +1448,22 @@ function buildSettings(root) {
   wrap.append(h("div.card",
     h("div.card-head", h("div.ico", { html: ICON.chart }), h("h3", "Skills")), urTol.el));
 
+  // replay viewer
+  const vc = cfg.viewer;
+  const skinSel = h("select.input.grow", h("option", { value: "" }, "osu!'s current skin"));
+  if (vc.skin) skinSel.append(h("option", { value: vc.skin, selected: true }, vc.skin));
+  const skinNote = h("div.small.muted", "Hit circles, cursor, judgements and hitsounds of the replay viewer come from this skin; what it lacks is drawn by osu!coach. Breaking a combo of 20 or more plays the skin's combobreak. Music and hitsound volumes are set in the viewer.");
+  api("skin").then(info => {
+    skinSel.replaceChildren(h("option", { value: "" }, `osu!'s current skin${info.current ? ` (${info.current})` : ""}`),
+      ...info.skins.map(name => h("option", { value: name, selected: name === vc.skin }, name)));
+  }).catch(() => { });
+  const musicOffset = sensSlider("Music offset", "Raise it if the viewer's music comes late, lower it if it comes early.",
+    vc.offset ?? 0, -100, 100, 1, " ms");
+  musicOffset.el.querySelector("input").classList.add("no-fill");   // 0 is the middle: no side is "filled"
+  wrap.append(h("div.card",
+    h("div.card-head", h("div.ico", { html: ICON.play }), h("h3", "Replay viewer")),
+    h("label.field", "Skin", skinSel), skinNote, musicOffset.el));
+
   // profile
   const habitPlays = h("input.input.num", { type: "number", min: 10, max: 1000, value: cfg.habit_plays });
   const skillPlays = h("input.input.num", { type: "number", min: 20, max: 2000, value: cfg.skill_plays });
@@ -1431,6 +1472,25 @@ function buildSettings(root) {
     h("div.two",
       h("label.field", h("span", "Recent plays for bad habits ", h("span.hint", "(also used when analysing replays)")), habitPlays),
       h("label.field", h("span", "Recent plays for levels ", h("span.hint", "(+ as many below AR 9 and above AR 10)")), skillPlays))));
+
+  // jump to a section: one link per card, the one in view lit
+  const cards = [...wrap.querySelectorAll(":scope > .card")];
+  const links = cards.map(card => h("button.chip", { onclick: () => card.scrollIntoView({ behavior: "smooth", block: "start" }) },
+    card.querySelector("h3").textContent));
+  const nav = h("nav.settings-nav", links);
+  wrap.before(nav);
+  const spy = e => {
+    const sc = e?.target;
+    if (!page.isConnected || page.offsetParent === null || sc && sc !== document && !sc.contains?.(page)) return;
+    const top = nav.getBoundingClientRect().bottom + 12;
+    // at the bottom the last cards can't reach the top: the one in the upper half of the window then
+    const bottom = sc && sc.scrollHeight != null && sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2;
+    let on = 0;
+    cards.forEach((c, i) => { if (c.getBoundingClientRect().top <= (bottom ? innerHeight / 2 : top)) on = i; });
+    links.forEach((l, i) => l.classList.toggle("pink", i === on));
+  };
+  document.addEventListener("scroll", spy, { passive: true, capture: true });
+  spy();
 
   wrap.append(h("div.row", { style: { position: "sticky", bottom: "0", padding: "14px 0", background: "linear-gradient(0deg, var(--bg) 60%, transparent)" } },
     h("div.grow"),
@@ -1441,11 +1501,13 @@ function buildSettings(root) {
           limit: +sLimit.value || 30, max_pages: +sPages.value || 100, mirror: sMirror.value.trim(), tag_min_pct: sTag.get() },
         advice: Object.fromEntries(Object.entries(sl).map(([k, v]) => [k, v.get()])),
         skills: { stream_ur_tolerance_pct: urTol.get() },
+        viewer: { skin: skinSel.value, offset: musicOffset.get() },
       };
       try {
         const r = await api("settings", data);
         const dirChanged = r.settings.osu_dir !== S.state.settings.osu_dir;
         S.state.settings = r.settings;
+        S.skin = null;   // the viewer's skin may have changed
         toast("Settings saved.");
         reloadProfile();
         if (dirChanged && S.pages.replays) { S.pages.replays.remove(); delete S.pages.replays; }
