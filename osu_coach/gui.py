@@ -480,6 +480,9 @@ def viewer_data(beatmap, results, replay, diff, rate, samples) -> dict:
                 "ht": r.hit_time, "sb": r.slider_break_time, "sk": r.slider_break_kind, "why": r.miss_reason}
         if r.cursor is not None:   # where the click was: the aim error meter
             item["cx"], item["cy"] = round(r.cursor[0], 1), round(r.cursor[1], 1)
+        elif r.miss_reason == "aim" and r.off_target_clicks:   # an aim miss: the click nearest the note's time
+            _, mx, my = min(r.off_target_clicks, key=lambda c: abs(c[0] - o.time))
+            item["cx"], item["cy"] = round(mx, 1), round(my, 1)
         s = by_index.get(o.index)
         if s is not None:
             item["pat"] = s.f.pattern
