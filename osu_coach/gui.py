@@ -54,6 +54,10 @@ DEFAULT_SETTINGS = {
         "mirror": "https://catboy.best/d/{set_id}",
         "tag_min_pct": 20.0,  # a skillset is tagged from this share of the map's intense notes (the main one always)
     },
+    "viewer": {
+        "skin": "",           # a folder of osu!'s Skins ("": the skin osu! itself uses)
+        "offset": 0,          # ms the viewer's music plays earlier (-100..100)
+    },
     "skills": {
         "stream_ur_tolerance_pct": 10.0,   # stream minimum BPM: UR within this of the UR at the comfort BPM
     },
@@ -430,6 +434,36 @@ def trends(samples: list) -> list[dict]:
     return sorted(out, key=lambda t: -t["z"])
 
 
+def skill_trends(samples: list) -> list[dict]:
+    """Miss rate per skillset (skillsets.TREND_SKILLS, in that order) in the newer and older half of the recent
+    plays; a skillset without enough notes in each half has no trend."""
+    from . import skillsets
+    plays = max((s.play for s in samples), default=-1) + 1
+    if plays < 10:
+        return []
+    half = plays // 2
+    counts = {k: [[0, 0], [0, 0]] for k, _ in skillsets.TREND_SKILLS}
+    for s in samples:
+        side = 0 if s.play < half else 1
+        for k in skillsets.trend_skills(s):
+            counts[k][side][0] += skillsets.trend_missed(s, k)
+            counts[k][side][1] += 1
+    out = []
+    for k, name in skillsets.TREND_SKILLS:
+        (m_new, n_new), (m_old, n_old) = counts[k]
+        if n_new < TREND_MIN_OBJECTS or n_old < TREND_MIN_OBJECTS:
+            out.append({"category": k, "name": name, "new": None, "old": None, "z": 0.0, "trend": "none",
+                        "plays": [half, plays - half]})
+            continue
+        new, old = m_new / n_new, m_old / n_old
+        pooled = (m_new + m_old) / (n_new + n_old)
+        se = math.sqrt(max(pooled * (1 - pooled), 1e-9) * (1 / n_new + 1 / n_old))
+        z = (new - old) / se if se else 0.0
+        out.append({"category": k, "name": name, "new": new, "old": old, "z": z,
+                    "trend": "worse" if z >= 2 else "better" if z <= -2 else "flat", "plays": [half, plays - half]})
+    return out
+
+
 # --- analysis of one replay ---------------------------------------------------------------------------------
 
 def viewer_data(beatmap, results, replay, diff, rate, samples) -> dict:
@@ -444,6 +478,8 @@ def viewer_data(beatmap, results, replay, diff, rate, samples) -> dict:
         item = {"i": o.index, "k": {SLIDER: "s", SPINNER: "p"}.get(o.kind, "c"), "t": o.time, "e": o.end_time,
                 "x": round(x, 1), "y": round(y, 1), "nc": o.new_combo, "res": r.result, "hr": r.head_result,
                 "ht": r.hit_time, "sb": r.slider_break_time, "sk": r.slider_break_kind, "why": r.miss_reason}
+        if r.cursor is not None:   # where the click was: the aim error meter
+            item["cx"], item["cy"] = round(r.cursor[0], 1), round(r.cursor[1], 1)
         s = by_index.get(o.index)
         if s is not None:
             item["pat"] = s.f.pattern
@@ -461,6 +497,32 @@ def viewer_data(beatmap, results, replay, diff, rate, samples) -> dict:
             "windows": [diff.hit300, diff.hit100, diff.hit50],
             "frames": {"t": [p.time for p in f], "x": [round(p.x, 1) for p in f], "y": [round(p.y, 1) for p in f],
                        "k": [p.keys for p in f]}}
+
+
+def map_audio(map_path) -> Path | None:
+    """The song of a map: the AudioFilename of its .osu, inside the map's folder."""
+    try:
+        for line in Path(map_path).read_text(encoding="utf-8-sig", errors="replace").splitlines():
+            key, sep, value = line.partition(":")
+            if sep and key.strip() == "AudioFilename":
+                folder = Path(map_path).parent.resolve()
+                path = (folder / value.strip()).resolve()
+                return path if folder in path.parents and path.is_file() else None
+            if line.strip() == "[Difficulty]":
+                break
+    except OSError:
+        pass
+    return None
+
+
+def play_sounds(beatmap, results, map_path, miss_window: float) -> list:
+    """The play's hitsounds for the viewer (skin.py); none when the map's samples can't be read."""
+    from . import skin
+    try:
+        return skin.play_sounds(beatmap, results, skin.map_sounds(Path(map_path)), miss_window)
+    except Exception:
+        traceback.print_exc()
+        return []
 
 
 def analyze(job: Job, settings: dict, replay_id: str) -> dict:
@@ -560,8 +622,11 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
         "setup": split_setup(setup_found),
         "setup_desc": setup.describe(),
         "training": training,
-        "trends": trend,
-        "viewer": viewer_data(beatmap, results, replay, diff, rate, play_samples),
+        "trends": skill_trends(habit_samples),
+        "viewer": {**viewer_data(beatmap, results, replay, diff, rate, play_samples),
+                   "sounds": play_sounds(beatmap, results, map_path, diff.hit50),
+                   "music": {"url": f"/audio/{replay.beatmap_md5}", "nightcore": bool(replay.mods & Mods.Nightcore)}
+                   if map_audio(map_path) else None},
     })
 
 
@@ -655,7 +720,7 @@ def build_player_profile(job: Job, settings: dict) -> dict:
         "misses": sum(s.missed for s in habit_samples), "setup_desc": setup.describe(),
         "habits": [insight_json(i) for i in habits], "notes": [insight_json(i) for i in notes],
         "setup": split_setup(setup_found),
-        "trends": trends(samples), "extra_plays": [low_used, high_used],
+        "trends": skill_trends(samples), "extra_plays": [low_used, high_used],
     })
     PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     PROFILE_PATH.write_text(json.dumps(data), encoding="utf-8")
@@ -972,7 +1037,7 @@ def recommend_maps(job: Job, settings: dict, q: dict) -> dict:
     chosen = [chosen] if isinstance(chosen, str) else chosen
     statuses = tuple(code for name, codes in (("ranked", rc.ACCEPTED_STATUS), ("loved", (rc.LOVED_STATUS,)),
                                               ("other", (0, 1, 2, 3, 6))) if name in chosen for code in codes)
-    per_skill = max(1, int(q.get("limit") or 15))
+    total = max(1, int(q.get("limit") or 30))   # maps in all, shared out among the skillsets
 
     model = player_model(job, settings)
     share = lambda sk: model.usual_shares.get(rc.SKILLS[sk][1], 0.0)
@@ -1024,8 +1089,11 @@ def recommend_maps(job: Job, settings: dict, q: dict) -> dict:
     tag_min = float(settings["search"]["tag_min_pct"]) / 100
     maptypes.TOP_KIND_MIN, maptypes.TOP_KINDS_SHOWN = tag_min, len(maptypes.KINDS)
     found = []
+    sizes = {sk: total // len(targets) + (i < total % len(targets)) for i, sk in enumerate(targets)}
     for sk in targets:
-        for n, k in enumerate(rc.ladder(sk, short[sk], kinds, content, profs, model, size=per_skill)):
+        if not sizes[sk]:
+            continue
+        for n, k in enumerate(rc.ladder(sk, short[sk], kinds, content, profs, model, size=sizes[sk])):
             a = kinds.get(f"{k.info.md5}:{k.mods}")
             local = k.info.md5 in infos
             r = map_row(k.score, k.info, k.mods, maptypes.label(a) if a else "", sorted(map_skills(a, tag_min)) if a else [],
@@ -1213,7 +1281,8 @@ def clean(x):
 
 LAST_PING = [time.time()]
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
-                ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png"}
+                ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
+                ".jpg": "image/jpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".mp3": "audio/mpeg"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1228,6 +1297,40 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, path: Path, ctype: str):
+        """A file, in parts when the browser asks (the audio element seeks with Range requests)."""
+        size = path.stat().st_size
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range") or "")
+        if not m or not (m.group(1) or m.group(2)):
+            self.send_response(200)
+            start, end = 0, size - 1
+        else:
+            if m.group(1):
+                start, end = int(m.group(1)), int(m.group(2)) if m.group(2) else size - 1
+            else:
+                start, end = max(0, size - int(m.group(2))), size - 1
+            end = min(end, size - 1)
+            if start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        with open(path, "rb") as f:
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                chunk = f.read(min(left, 1 << 16))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
+
     def _json(self, data, code: int = 200):
         self._send(code, json.dumps(clean(data)).encode("utf-8"), "application/json")
 
@@ -1239,6 +1342,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path.startswith("/api/"):
                 return self._json(self.api_get(url.path[5:], urllib.parse.parse_qs(url.query)))
+            if url.path.startswith("/skin/"):   # the player's osu! skin: images and hitsounds for the viewer
+                from . import skin
+                settings = load_settings()
+                path = skin.skin_file(osu_dir_of(settings), settings["viewer"]["skin"],
+                                      urllib.parse.unquote(url.path[len("/skin/"):]))
+                if path is None:
+                    return self._send(404, b"not found", "text/plain")
+                return self._send(200, path.read_bytes(), STATIC_TYPES.get(path.suffix.lower(), "application/octet-stream"))
+            if url.path.startswith("/audio/"):   # the song of a map, for the viewer
+                md5 = url.path[len("/audio/"):]
+                map_path = STATE.index.find(md5) if STATE.index and re.fullmatch(r"[0-9a-f]{32}", md5) else None
+                path = map_audio(map_path) if map_path else None
+                if path is None:
+                    return self._send(404, b"not found", "text/plain")
+                try:
+                    return self._send_file(path, STATIC_TYPES.get(path.suffix.lower(), "application/octet-stream"))
+                except (ConnectionError, OSError):
+                    return   # the browser dropped the request (it does when seeking)
             rel = "index.html" if url.path in ("", "/") else url.path.lstrip("/")
             path = (UI_DIR / rel).resolve()
             if UI_DIR not in path.parents or not path.is_file():
@@ -1283,6 +1404,9 @@ class Handler(BaseHTTPRequestHandler):
             return replay_rows(settings)
         if route == "profile":
             return load_profile()
+        if route == "skin":
+            from . import skin
+            return skin.describe(osu_dir_of(settings), settings["viewer"]["skin"])
         if route == "elo":
             return {"elo": load_elo()}
         if route.startswith("job/"):

@@ -20,7 +20,7 @@ import numpy as np
 from .locate import CACHE_DIR
 
 PLAYS_PATH = CACHE_DIR / "elo_plays.json"   # the challenges of every play judged so far, by replay file
-PLAYS_VERSION = "1"
+PLAYS_VERSION = "2"   # 2: alt only from 130 to 180 BPM, as on the Skills page
 DAYS = 90
 WARMUP_DAYS = 30               # the plays of the month before the 90 days give the starting rating
 MIN_WARMUP_PLAYS = 10
@@ -30,7 +30,7 @@ MAX_STEP = 60.0                # a single play moves a rating by at most this mu
 # skill: (label, pass rate at equal ratings: the reference player's own, K per challenge)
 SKILLS = {
     "streams": ("Streams", 0.868, 6.0),
-    "alt": ("Alt", 0.647, 6.0),
+    "alt": ("Alt", 0.662, 6.0),
     "finger": ("Finger control", 0.953, 1.5),
     "jumps": ("Jumps", 0.967, 1.0),
     "flow": ("Flow aim", 0.979, 0.8),
@@ -44,7 +44,7 @@ SKILLS = {
 # once on the reference player's plays of the last 90 days on 2026-09-30 (tools/calibrate-elo.py) and kept fixed
 CALIBRATION = {
     "streams": (216.002, 953.8),       # stream BPM x (length / 16)^0.15 x (1 + 0.1 spacing), 9+ notes
-    "alt": (215.216, 842.7),           # alt BPM x (1 + 0.15 spacing)
+    "alt": (202.953, 909.5),           # alt BPM x (1 + 0.15 spacing), 130-180 BPM (refitted on 2026-09-30)
     "finger": (178.295, 164.6),        # burst BPM x (notes / 4)^0.1, 2-8 notes
     "jumps": (39.4884, 304.1),         # radii per second, 3+ radii
     "flow": (15.6837, 276.5),          # radii per second, 0.3-3 radii
@@ -66,6 +66,7 @@ def challenges(samples, rate: float, hit300: float) -> dict[str, list[tuple[floa
     from .beatmap import CIRCLE, SLIDER
     from .features import FIRST, STREAM_FAMILY
     from .maptypes import _run_kind
+    from .skillsets import ALT_BPM
     out: dict[str, list] = defaultdict(list)
     runs: dict[tuple, list] = defaultdict(list)
     for s in samples:
@@ -76,7 +77,8 @@ def challenges(samples, rate: float, hit300: float) -> dict[str, list[tuple[floa
         if not f.bpm:
             continue
         if _run_kind(f) == "alt":
-            out["alt"].append((f.bpm * (1 + 0.15 * f.run_spacing), cleared))
+            if ALT_BPM[0] <= f.bpm < ALT_BPM[1]:   # the range of the Skills page
+                out["alt"].append((f.bpm * (1 + 0.15 * f.run_spacing), cleared))
         elif f.pattern in STREAM_FAMILY and f.run_length >= 9:
             out["streams"].append((f.bpm * (f.run_length / 16) ** 0.15 * (1 + 0.1 * f.run_spacing), cleared))
         elif f.pattern in STREAM_FAMILY and 2 <= f.run_length <= 8:

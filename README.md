@@ -36,7 +36,8 @@ Open **osu!coach** from the shortcut. The window has these sections:
 - **Improvement**: a rating per skillset, updated after every play, day by day over the last 90 days (about 1200
   for a balanced player; +400 means ten times the odds of passing the same pattern).
 - **Replay analysis**: pick a replay (or import an `.osr`) and press **Analyze**: the play in a replay viewer, every
-  mistake with its timestamp and reason (click it to watch that moment), and what to train.
+  mistake with its timestamp and reason (click it to watch that moment), and what to train. The viewer uses your
+  osu! skin (images and hitsounds; another skin can be picked in Settings).
 - **Beatmap search**: find maps by name, skillset, stars, AR, CS, OD, BPM and length, in your Songs folder or on the
   osu! site; tick **Recommended for me** for maps a step above your level in the skillsets you pick. Click a map to
   open its page, or download it (then press F5 in osu!'s song select).
