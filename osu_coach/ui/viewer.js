@@ -208,29 +208,46 @@
       }
       for (const bit of [1, 2]) if (down[bit] !== null) this.keyRuns[bit].push([down[bit], f.t[f.t.length - 1]]);
       this.keyStarts = { 1: this.keyRuns[1].map(r => r[0]), 2: this.keyRuns[2].map(r => r[0]) };
-      // every click on a circle or slider head: its offset from the centre in radii, and the incoming movement
+      // every click on a circle or slider head, misses included (a miss by aim: its nearest click): the offset from
+      // the centre in radii and in osu! pixels, and the incoming movement
       this.aims = [];
       let before = null;
       for (const o of objs) {
         if (o.k === "p") { before = null; continue; }
-        if (o.cx != null && (o.k === "c" ? o.res > 0 : o.hr > 0)) {
-          const dx = (o.cx - o.x) / d.radius, dy = (o.cy - o.y) / d.radius;
+        const res = o.k === "c" ? o.res : o.hr;
+        if (o.cx != null && res != null) {
+          const px = o.cx - o.x, py = o.cy - o.y;
           let dir = null;
           if (before) {
             const mx = o.x - before.x, my = o.y - before.y, len = Math.hypot(mx, my);
             if (len >= d.radius) dir = [mx / len, my / len];
           }
-          this.aims.push({ t: o.ht ?? o.t, dx, dy, dir, res: o.k === "c" ? o.res : o.hr });
+          this.aims.push({ t: o.ht ?? o.t, dx: px / d.radius, dy: py / d.radius, px, py, dir, res });
         }
         before = o.k === "s" ? { x: o.path[o.rep % 2 === 0 ? 0 : o.path.length - 1][0], y: o.path[o.rep % 2 === 0 ? 0 : o.path.length - 1][1] } : o;
       }
       this.aims.sort((a, b) => a.t - b.t);
       this.aimTimes = this.aims.map(a => a.t);
+      // running sums for the live UR (hit error of circles and slider heads, real time, counted as analysis.py does:
+      // a slider whose head was missed by timing still counts if the slider scored) and the aim UR (10 x the spread
+      // of the hits around their mean click point, osu! pixels): index i = the first i
+      const urHits = objs.filter(o => o.k !== "p" && o.ht != null && (o.hr || o.res))
+        .map(o => ({ t: o.ht, e: (o.ht - o.t) / d.rate })).sort((a, b) => a.t - b.t);
+      this.urTimes = urHits.map(h => h.t);
+      this.urSums = [[0, 0, 0]];
+      for (const h of urHits) { const [n, s, q] = this.urSums[this.urSums.length - 1]; this.urSums.push([n + 1, s + h.e, q + h.e * h.e]); }
+      this.aimSums = [[0, 0, 0, 0]];
+      for (const a of this.aims) {
+        const [n, sx, sy, q] = this.aimSums[this.aimSums.length - 1];
+        this.aimSums.push(a.res > 0 ? [n + 1, sx + a.px, sy + a.py, q + a.px * a.px + a.py * a.py] : [n, sx, sy, q]);
+      }
       this.aimTurned = false;
       this.stripSpan = STRIP_DEFAULT;
       this.judged = objs.filter(o => o.res != null).slice().sort((a, b) => a.jt - b.jt);
       this.judgedTimes = this.judged.map(o => o.jt);
-      this.hits = objs.filter(o => o.k === "c" && o.ht != null && o.res > 0).map(o => ({ t: o.ht, err: o.ht - o.t, res: o.res }))
+      // the hit error bar: circles and slider heads (coloured by the head's own judgement)
+      this.hits = objs.filter(o => o.k !== "p" && o.ht != null && (o.k === "c" ? o.res : o.hr) > 0)
+        .map(o => ({ t: o.ht, err: o.ht - o.t, res: o.k === "c" ? o.res : o.hr }))
         .sort((a, b) => a.t - b.t);
       this.hitTimes = this.hits.map(h => h.t);
       this.start = Math.min(objs.length ? objs[0].t - 1500 : 0, f.t.length ? f.t[0] : 0);
@@ -766,6 +783,13 @@
         ctx.beginPath(); ctx.moveTo(mx, cy - 12 * u); ctx.lineTo(mx - 5 * u, cy - 19 * u); ctx.lineTo(mx + 5 * u, cy - 19 * u); ctx.fill();
       }
       ctx.globalAlpha = 1;
+      const [urN, urS, urQ] = this.urSums[lowerBound(this.urTimes, now + 1)];
+      if (urN > 1) {   // the UR so far, over the bar
+        const ur = 10 * Math.sqrt(Math.max(0, urQ / urN - (urS / urN) ** 2));
+        ctx.font = `600 ${12 * u}px "Cascadia Mono", Consolas, monospace`; ctx.fillStyle = "rgba(255,255,255,.85)";
+        ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillText(`UR ${ur.toFixed(2)}`, cx, cy - 22 * u);
+      }
       ctx.font = `600 ${10.5 * u}px "Segoe UI", sans-serif`; ctx.fillStyle = "rgba(255,255,255,.45)";
       ctx.textAlign = "right"; ctx.textBaseline = "middle";
       ctx.fillText("early", cx - bwid / 2 - 8 * u, cy);
@@ -868,6 +892,12 @@
         }
         const px = cx + Math.max(-1.2, Math.min(1.2, dx)) * R, py = cy + Math.max(-1.2, Math.min(1.2, dy)) * R;
         ctx.globalAlpha = .25 + .75 * (1 - (now - a.t) / span);
+        if (!a.res) {   // a miss: a cross (at the meter's edge when the click was farther)
+          const m = 3.2 * u;
+          ctx.strokeStyle = RES_COLOR[0]; ctx.lineWidth = 1.8 * u;
+          ctx.beginPath(); ctx.moveTo(px - m, py - m); ctx.lineTo(px + m, py + m); ctx.moveTo(px + m, py - m); ctx.lineTo(px - m, py + m); ctx.stroke();
+          continue;
+        }
         ctx.fillStyle = RES_COLOR[a.res];
         ctx.beginPath(); ctx.arc(px, py, 2.6 * u, 0, Math.PI * 2); ctx.fill();
         sx += dx; sy += dy; n++;
@@ -881,6 +911,13 @@
       ctx.font = `600 ${10.5 * u}px "Segoe UI", sans-serif`; ctx.fillStyle = "rgba(255,255,255,.5)";
       ctx.textAlign = "center"; ctx.textBaseline = "top";
       ctx.fillText(this.aimTurned ? "aim error · movement ↑" : "aim error", cx, cy + R * 1.25 + 4 * u);
+      const [an, asx, asy, aq] = this.aimSums[lowerBound(this.aimTimes, now + 1)];
+      if (an > 1) {   // the aim UR so far, over the meter
+        const aur = 10 * Math.sqrt(Math.max(0, aq / an - (asx / an) ** 2 - (asy / an) ** 2));
+        ctx.font = `600 ${12 * u}px "Cascadia Mono", Consolas, monospace`; ctx.fillStyle = "rgba(255,255,255,.85)";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(`aim UR ${aur.toFixed(1)}`, cx, cy - R * 1.25 - 4 * u);
+      }
     }
 
     drawTimelineBase() {

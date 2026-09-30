@@ -390,7 +390,7 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .barcell .meter { width: 90px; height: 6px; flex: none; }
 ul.also { margin: 0 0 12px; padding-left: 18px; color: var(--text-2); font-size: 13px; display: grid; gap: 4px; }
 ul.also b { color: var(--text); font-weight: 600; }
-.mistakes { max-height: 560px; overflow: auto; }
+.card.mistakes { max-height: 560px; overflow: auto; }   /* .card: beats .card.flush's overflow: hidden */
 .mistakes thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
 .time-btn { font-family: var(--mono); gap: 6px; }
 .time-btn svg { width: 11px; height: 11px; }
