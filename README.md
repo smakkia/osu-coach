@@ -8,11 +8,11 @@ Windows only, osu! stable only (not lazer), osu!standard only.
 
 ## Install
 
-1. Download the project (**Code** > **Download ZIP**, then extract it) into a folder you'll keep, e.g.
-   `Documents\osu-coach`.
-2. Double-click **`install.bat`**. It installs Python if you don't have it (it asks first), the libraries, and the map
-   data, then adds an **osu!coach** shortcut to the desktop and the Start menu and opens the app. If you play with a
-   tablet, it can also install [OpenTabletDriver](https://opentabletdriver.net/) (optional, it asks).
+1. Download **`osu-coach-Setup-<version>.exe`** from the [latest release](https://github.com/smakkia/osu-coach/releases/latest).
+2. Run it. Windows may warn about an unknown publisher (the installer isn't signed): click **More info** > **Run
+   anyway**. It installs osu!coach for your user (no administrator rights, nothing else to install) with a Start menu
+   shortcut, and optionally a desktop one; if you play with a tablet, it can also install
+   [OpenTabletDriver](https://opentabletdriver.net/) (optional, unticked).
 3. The first time, a setup wizard asks for:
    - your **osu! folder** (usually found by itself);
    - your **osu! API** credentials, only needed to search maps on the osu! site: in your
@@ -23,7 +23,14 @@ Windows only, osu! stable only (not lazer), osu!standard only.
 
    Then it builds your profile from your recent plays (a minute or two).
 
-To update, download the new version over the old one and run `install.bat` again.
+To update, run the new version's setup: your settings, profile and API credentials (in `%LOCALAPPDATA%\osu-coach`)
+are kept, also when you uninstall it from the Windows settings.
+
+**From the source code** (to change it): download the project (**Code** > **Download ZIP**) into a folder you'll keep
+and double-click **`install.bat`**: it installs Python if needed (it asks first), the libraries and the map data, and
+adds the shortcuts. To build the installer: `.venv\Scripts\python -m pip install -r requirements-dev.txt`, install
+[Inno Setup 6](https://jrsoftware.org/isinfo.php), then run `tools\build-setup.ps1` (it writes
+`dist\osu-coach-Setup-<version>.exe`, the version being `osu_coach/__init__.py`'s).
 
 ## Using it
 

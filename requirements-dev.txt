@@ -1,0 +1,4 @@
+-r requirements.txt
+# only to train the map type guesser (retrain) and to build the installer (tools/build-setup.ps1)
+scikit-learn==1.9.1
+pyinstaller==6.22.3

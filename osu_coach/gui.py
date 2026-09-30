@@ -1505,15 +1505,33 @@ def detect() -> dict:
     }
 
 
+def pick_folder_here(out_path: str):
+    """The folder picker itself (tkinter), writing the chosen folder to out_path."""
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    Path(out_path).write_text(filedialog.askdirectory(title="osu! folder") or "", encoding="utf-8")
+
+
 def pick_folder() -> str:
-    """A native folder picker (tkinter), run in its own process so it never fights the server's threads."""
-    code = ("import tkinter as tk; from tkinter import filedialog; r = tk.Tk(); r.withdraw(); "
-            "r.attributes('-topmost', True); print(filedialog.askdirectory(title='osu! folder') or '')")
-    exe = Path(sys.executable)
-    python = exe.with_name("python.exe") if exe.name.lower() == "pythonw.exe" else exe
-    out = subprocess.run([str(python), "-c", code], capture_output=True, text=True,
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    return out.stdout.strip()
+    """A native folder picker (tkinter), run in its own process so it never fights the server's threads: this
+    Python again, or the packaged app (osu-coach.exe --pick-folder)."""
+    import tempfile
+    fd, out_path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    try:
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--pick-folder", out_path]
+        else:
+            exe = Path(sys.executable)
+            python = exe.with_name("python.exe") if exe.name.lower() == "pythonw.exe" else exe
+            cmd = [str(python), "-c", f"from osu_coach.gui import pick_folder_here; pick_folder_here({out_path!r})"]
+        subprocess.run(cmd, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return Path(out_path).read_text(encoding="utf-8").strip()
+    finally:
+        Path(out_path).unlink(missing_ok=True)
 
 
 # --- the window ---------------------------------------------------------------------------------------------------
@@ -1534,11 +1552,14 @@ def main():
     if sys.stderr is None:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         sys.stderr = open(CACHE_DIR / "ui_errors.log", "a", encoding="utf-8")
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    # for tests: OSU_COACH_PORT=8765 serves on that port, OSU_COACH_NO_WINDOW=1 opens no window
+    server = ThreadingHTTPServer(("127.0.0.1", int(os.environ.get("OSU_COACH_PORT") or 0)), Handler)
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     threading.Thread(target=server.serve_forever, daemon=True).start()
     browser = _app_browser()
-    if browser:
+    if os.environ.get("OSU_COACH_NO_WINDOW"):
+        pass
+    elif browser:
         subprocess.Popen([browser, f"--app={url}", f"--user-data-dir={BROWSER_PROFILE}", "--window-size=1440,920",
                           "--no-first-run", "--no-default-browser-check"])
     else:

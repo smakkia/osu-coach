@@ -63,7 +63,7 @@ if (-not $python) {
 Info "Using $python"
 
 # --- virtual environment and libraries ------------------------------------------------------------------------
-Step "Libraries (numpy, scikit-learn) in a private environment"
+Step "Libraries (numpy) in a private environment"
 $venvPython = Join-Path $Venv "Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
     & $python -m venv $Venv
@@ -75,7 +75,7 @@ Info "Done."
 
 # --- shared map data --------------------------------------------------------------------------------------------
 Step "Map type guesser (makes the search on the osu! site much faster)"
-if (Test-Path (Join-Path $Cache "typeguess.pkl")) {
+if ((Test-Path (Join-Path $Cache "typeguess_lite.pkl")) -or (Test-Path (Join-Path $Cache "typeguess.pkl"))) {
     Info "Already there."
 } elseif ($DataUrl -match "/OWNER/") {
     Info "No download address set in install.ps1: skipped (the site search still works, only slower)."
