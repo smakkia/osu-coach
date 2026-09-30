@@ -14,8 +14,8 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Venv = Join-Path $Root ".venv"
 $Cache = Join-Path $env:LOCALAPPDATA "osu-coach"
-# the shared map data, attached to the project's GitHub releases (see README, "Releasing")
-$DataUrl = "https://github.com/OWNER/osu-coach/releases/latest/download/osu-coach-data.zip"
+# the shared map data, attached to the project's GitHub releases (built by tools/make-data-zip.ps1)
+$DataUrl = "https://github.com/smakkia/osu-coach/releases/latest/download/osu-coach-data.zip"
 
 function Step($text) { Write-Host ""; Write-Host "==> $text" -ForegroundColor Magenta }
 function Info($text) { Write-Host "    $text" }
