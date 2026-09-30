@@ -4,8 +4,21 @@
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.win32.versioninfo import (FixedFileInfo, StringFileInfo, StringStruct, StringTable,
+                                                 VarFileInfo, VarStruct, VSVersionInfo)
 
 ROOT = Path(SPECPATH).parent
+VERSION = next(line.split('"')[1] for line in (ROOT / "osu_coach" / "__init__.py").read_text().splitlines()
+               if line.startswith("__version__"))
+NUMS = tuple((list(map(int, VERSION.split("."))) + [0, 0, 0, 0])[:4])
+# the name Task Manager shows for the process, and the file's details
+VERSION_INFO = VSVersionInfo(
+    ffi=FixedFileInfo(filevers=NUMS, prodvers=NUMS),
+    kids=[StringFileInfo([StringTable("040904B0", [
+              StringStruct("FileDescription", "osu!coach"), StringStruct("ProductName", "osu!coach"),
+              StringStruct("FileVersion", VERSION), StringStruct("ProductVersion", VERSION),
+              StringStruct("InternalName", "osu-coach"), StringStruct("OriginalFilename", "osu-coach.exe")])]),
+          VarFileInfo([VarStruct("Translation", [1033, 1200])])])
 
 a = Analysis(
     [str(ROOT / "tools" / "osu_coach_app.py")],
@@ -26,6 +39,7 @@ exe = EXE(
     exclude_binaries=True,
     name="osu-coach",
     icon=str(ROOT / "osu_coach" / "ui" / "icon.ico"),
+    version=VERSION_INFO,
     console=False,
     upx=False,          # packed exes look suspicious to antivirus programs
 )
