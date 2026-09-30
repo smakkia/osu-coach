@@ -1,0 +1,1433 @@
+"""The desktop window: python -m osu_coach ui
+
+A small local web server (standard library only) serves the page in osu_coach/ui/ and a JSON API over the
+analysis modules; the page opens in a chromeless Edge/Chrome window (--app), or the default browser when neither
+is found. Slow work (judging replays, searching the osu! site, downloading) runs as a background job the page
+polls, so the window never blocks. The server stops a while after the window stops pinging it.
+"""
+
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.parse
+import urllib.request
+import uuid
+import webbrowser
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import asdict, is_dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from .binary import BinaryReader
+from .locate import CACHE_DIR, BeatmapIndex, default_osu_dir, replays_dir, songs_dir
+
+UI_DIR = Path(__file__).resolve().parent / "ui"
+SETTINGS_PATH = CACHE_DIR / "ui_settings.json"
+REPLAY_STATS_PATH = CACHE_DIR / "ui_replays.json"     # header counts of each replay (combo, 300s, misses...)
+PROFILE_PATH = CACHE_DIR / "ui_profile.json"          # bad habits and trends of the last profile run
+SKILLSETS_PATH = CACHE_DIR / "ui_skillsets.json"      # the Skills section's statistics (skillsets.py)
+SETUP_STATS_PATH = CACHE_DIR / "ui_setup_stats.json"  # what the area / key advice measured in the plays
+ELO_PATH = CACHE_DIR / "ui_elo.json"                  # the Improvement page: ratings per skillset, day by day
+IMPORTED_DIR = CACHE_DIR / "imported"                 # replays added from the file manager
+BROWSER_PROFILE = CACHE_DIR / "ui_browser"            # the app window's own browser profile
+IDLE_EXIT_S = 180            # no ping from the window for this long: the window was closed
+TREND_MIN_OBJECTS = 150      # objects of a category each half of the recent plays needs for a trend
+
+DEFAULT_SETTINGS = {
+    "osu_dir": "",
+    "habit_plays": 50,        # recent plays the bad habits come from
+    "skill_plays": 100,       # recent plays the skill levels come from (+ as many below AR 9 and above AR 10)
+    "search": {
+        "source": ["online"],  # "online": maps on the osu! site you don't have; "songs": your Songs folder
+        "mods": ["NM"],
+        "status": ["ranked"],  # any of "ranked", "loved", "other" (graveyard, pending...: Songs only)
+        "unplayed": False,
+        "limit": 30,
+        "max_pages": 100,
+        "mirror": "https://catboy.best/d/{set_id}",
+        "tag_min_pct": 20.0,  # a skillset is tagged from this share of the map's intense notes (the main one always)
+    },
+    "skills": {
+        "stream_ur_tolerance_pct": 10.0,   # stream minimum BPM: UR within this of the UR at the comfort BPM
+    },
+    "advice": {
+        "area_scale_pct": 3.0,      # overaim/underaim below this share of the jump isn't worth changing the area for
+        "area_rotation_deg": 1.5,
+        "area_offset_radii": 0.2,
+        "rt_ghosts_per_1000": 1.0,  # ghost presses per 1000 before advising a higher rapid trigger distance
+        "rt_stuck_pct": 10.0,       # share of the stream/alt misses with a key not reset before a lower release
+    },
+}
+
+# bad habit -> what to do about it (matched on the title the analysis writes)
+SOLUTIONS = (
+    (r"^(Doubles|Triples) are", "Train short patterns (doubles and triples) on finger control/burst maps: count the "
+                                "notes as you tap them and keep the rhythm with your fingers, not with the cursor."),
+    (r"^(Bursts|Streams|Deathstreams) are|Streams fall apart",
+     "Play streams slightly below your limit until they are clean, then go up 5-10 BPM. Keep tapping and cursor "
+     "together: slow and in sync beats fast and out of sync."),
+    (r"Cursor and taps drift", "Slow the cursor down and follow your tapping: every tap should land on a note. "
+                               "Train spaced streams at a comfortable BPM, watching where the cursor goes."),
+    (r"towards the end of streams|Long streams break down",
+     "Stamina on long streams: maps with deathstreams 20-30 BPM below your maximum, focusing on keeping the rhythm "
+     "until the very last note."),
+    (r"fully alternate", "Always alternate on fast streams (even starting with your weaker finger): relax your hand "
+                         "and share the load."),
+    (r"Alt patterns|Direction changes break your alt|Wide alt",
+     "Train alt maps (e.g. Prayer, Running in the 90s) just below your comfortable BPM: the cursor has to anticipate "
+     "the change of direction while your fingers keep the rhythm."),
+    (r"Jumps wider|Weaker on .* jumps", "Jump maps with growing spacing: first at a comfortable BPM, then faster. "
+                                        "Move your arm, not just your wrist, on long jumps."),
+    (r"jump misses land", "If you land short: finish the movement and stop on the circle; if you overshoot: slow the "
+                          "cursor down before the circle. Train jumps at a comfortable speed aiming for the centre."),
+    (r"Irregular rhythms|irregular rhythms", "Listen to the music: on 1/3 and 1/6 rhythms count the beats out loud. "
+                                             "Train finger control/tech maps with varied rhythms."),
+    (r"Slider breaks|leave sliders too early", "Follow the slider to the end and hold the key until the ball stops; "
+                                               "train tech maps at a comfortable speed."),
+    (r"misread note order|Busy screens", "Reading: play maps with lower AR and busy screens (HD too) at a comfortable "
+                                         "difficulty, looking ahead at the next notes."),
+    (r"You hit .* on average|Timing bias",
+     "Adjust your offset as suggested (check it with the hit error bar), then tap to the sound, not to the "
+     "approach circle."),
+    (r"Accuracy drops",
+     "Train accuracy: high-OD maps at a comfortable difficulty, aiming for 300s rather than stars, tapping to the "
+     "sound."),
+    (r"^Stamina", "Stamina: long, dense maps at a comfortable difficulty, without stopping. Relax your hand in the "
+                  "breaks."),
+    (r"High AR", "Reaction time: train with DT on maps easier than your usual ones, then raise the stars."),
+    (r"overaim|underaim|rotated|clicks are shifted|area|sensitivity",
+     "Change the settings as suggested and play 20-30 maps before judging: it will feel odd at first."),
+    (r"Ghost key presses", "Raise your actuation point or rapid trigger press distance a little."),
+    (r"don't reset", "Lower your actuation point or rapid trigger release distance a little."),
+)
+
+# analysis category -> the map type to search for training it
+TRAIN_SKILL = {"streams": "stream", "alt": "alt", "jumps": "jump", "irregular": "finger control",
+               "sliders": "tech", "reading": "reading", "stamina": "stream", "dt": "reading", "aim": "aim control"}
+SKILL_NAMES = {"stream": "stream", "alt": "alt", "jump": "jump", "finger control": "finger control/burst",
+                  "tech": "tech", "reading": "reading", "aim control": "aim control", "speed": "speed",
+                  "precision": "precision"}
+
+
+OFFSET_SOLUTION = ("Your hits are off time rather than spread out: adjust your offset as suggested (check it with the "
+                   "hit error bar), then tap to the sound, not to the approach circle.")
+
+
+def solution_for(title: str, evidence: dict | None = None) -> str:
+    if (evidence or {}).get("cause") == "timing":
+        return OFFSET_SOLUTION
+    for pattern, text in SOLUTIONS:
+        if re.search(pattern, title, re.IGNORECASE):
+            return text
+    return ""
+
+
+# --- settings ---------------------------------------------------------------------------------------------
+
+def _merge(default: dict, saved: dict) -> dict:
+    out = {}
+    for k, v in default.items():
+        if isinstance(v, dict):
+            out[k] = _merge(v, saved.get(k) if isinstance(saved.get(k), dict) else {})
+        else:
+            out[k] = saved.get(k, v)
+    return out
+
+
+def load_settings() -> dict:
+    try:
+        saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    return _merge(DEFAULT_SETTINGS, saved)
+
+
+def save_settings(data: dict) -> dict:
+    merged = _merge(DEFAULT_SETTINGS, data)
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    return merged
+
+
+def apply_advice_settings(settings: dict):
+    """The cutoffs of the area and rapid trigger advice are the setup_advice constants."""
+    from . import setup_advice as sa
+    a = settings["advice"]
+    sa.MIN_SCALE = float(a["area_scale_pct"]) / 100
+    sa.MIN_ROTATION_DEG = float(a["area_rotation_deg"])
+    sa.MIN_OFFSET_RADII = float(a["area_offset_radii"])
+    sa.GHOSTS_PER_1000 = float(a["rt_ghosts_per_1000"])
+    sa.STUCK_SHARE = float(a["rt_stuck_pct"]) / 100
+
+
+def osu_dir_of(settings: dict) -> Path:
+    d = settings.get("osu_dir") or ""
+    osu_dir = Path(d) if d else default_osu_dir()
+    if not osu_dir or not osu_dir.exists():
+        raise UserError("osu! folder not found: set it in Settings.")
+    return osu_dir
+
+
+# --- jobs -------------------------------------------------------------------------------------------------
+
+class UserError(Exception):
+    """A problem to show as it is, without a traceback."""
+
+
+class Cancelled(Exception):
+    pass
+
+
+class Job:
+    def __init__(self, kind: str):
+        self.id = uuid.uuid4().hex[:12]
+        self.kind = kind
+        self.status = "running"      # running, done, error, cancelled
+        self.label = ""
+        self.done = 0
+        self.total = 0
+        self.result = None
+        self.error = ""
+        self.partial = None          # results so far (search)
+        self.cancel = threading.Event()
+        self.started = time.time()
+
+    def step(self, label: str, done: int = 0, total: int = 0):
+        self.check()
+        self.label, self.done, self.total = label, done, total
+
+    def check(self):
+        if self.cancel.is_set():
+            raise Cancelled()
+
+    def public(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "status": self.status, "label": self.label, "done": self.done,
+                "total": self.total, "error": self.error, "result": self.result, "partial": self.partial,
+                "elapsed": time.time() - self.started}
+
+
+JOBS: dict[str, Job] = {}
+
+
+def start_job(kind: str, work) -> Job:
+    job = Job(kind)
+    JOBS[job.id] = job
+
+    def run():
+        try:
+            job.result = work(job)
+            job.status = "done"
+        except Cancelled:
+            job.status = "cancelled"
+        except UserError as e:
+            job.status, job.error = "error", str(e)
+        except Exception as e:   # shown in the window instead of killing the server
+            job.status, job.error = "error", f"{type(e).__name__}: {e}"
+            traceback.print_exc()
+    threading.Thread(target=run, daemon=True).start()
+    return job
+
+
+# --- shared state: maps and replays -----------------------------------------------------------------------
+
+class State:
+    """osu!.db and the replay index, loaded once per osu! folder (reloaded on demand)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.osu_dir: Path | None = None
+        self.index: BeatmapIndex | None = None
+        self.replays = None
+        self.maps = None
+        self.infos: dict = {}
+        self.habits_cache: dict = {}
+
+    def load(self, settings: dict, force: bool = False):
+        from .mapdb import read_osu_db
+        from .replay_index import ReplayIndex
+        with self.lock:
+            osu_dir = osu_dir_of(settings)
+            if force or self.osu_dir != osu_dir or self.replays is None:
+                self.osu_dir = osu_dir
+                self.index = BeatmapIndex(osu_dir)
+                self.replays = ReplayIndex(osu_dir, self.index)
+                self.maps = read_osu_db(osu_dir / "osu!.db")
+                self.infos = {m.md5: m for m in self.maps}
+            return self
+
+
+STATE = State()
+
+
+def read_header(path: Path) -> dict | None:
+    """Counts, combo and score from a replay's header (the first bytes only)."""
+    try:
+        with open(path, "rb") as f:
+            r = BinaryReader(f.read(1024))
+        mode, _ = r.byte(), r.int()
+        md5, player, _ = r.string(), r.string(), r.string()
+        c300, c100, c50, geki, katu, miss = (r.short() for _ in range(6))
+        score, combo, perfect, mods = r.int(), r.short(), r.bool(), r.int()
+        return {"mode": mode, "md5": md5, "player": player, "c300": c300, "c100": c100, "c50": c50, "miss": miss,
+                "score": score, "combo": combo, "perfect": perfect, "mods": mods}
+    except Exception:
+        return None
+
+
+def accuracy(h: dict) -> float:
+    total = h["c300"] + h["c100"] + h["c50"] + h["miss"]
+    return (300 * h["c300"] + 100 * h["c100"] + 50 * h["c50"]) / (300 * total) if total else 0.0
+
+
+def replay_rows(settings: dict) -> dict:
+    from .mods import mods_string
+    from .recommend import _star_key
+    st = STATE.load(settings)
+    try:
+        cache = json.loads(REPLAY_STATS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    rows, changed = [], False
+    entries = [("r", e.name, st.replays.path(e), e) for e in st.replays.entries.values() if e.mode == 0]
+    if IMPORTED_DIR.exists():
+        entries += [("i", p.name, p, None) for p in IMPORTED_DIR.glob("*.osr")]
+    for source, name, path, entry in entries:
+        key = f"{source}:{name}"
+        try:
+            s = path.stat()
+        except OSError:
+            continue
+        h = cache.get(key)
+        if not h or h.get("mtime") != s.st_mtime:
+            h = read_header(path)
+            if h is None or h["mode"] != 0:
+                continue
+            h["mtime"] = s.st_mtime
+            cache[key] = h
+            changed = True
+        m = st.infos.get(h["md5"])
+        played = entry.time if entry else s.st_mtime
+        rows.append({
+            "id": key, "source": source, "time": played, "player": h["player"],
+            "map": m.display_name if m else "(map not in Songs)", "found": m is not None,
+            "supported": not h["mods"] & (128 | 8192),     # Relax / Autopilot can't be analysed
+            "stars": (m.stars.get(_star_key(h["mods"])) or m.stars.get(0)) if m else None,
+            "mods": mods_string(h["mods"]), "combo": h["combo"], "max_combo": None, "acc": accuracy(h),
+            "miss": h["miss"], "c100": h["c100"], "c50": h["c50"], "perfect": h["perfect"],
+            "beatmap_id": m.beatmap_id if m and m.beatmap_id > 0 else None,
+        })
+    if changed:
+        REPLAY_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        REPLAY_STATS_PATH.write_text(json.dumps(cache), encoding="utf-8")
+    rows.sort(key=lambda r: -r["time"])
+    return {"owner": st.replays.owner, "replays": rows}
+
+
+def replay_path(replay_id: str) -> Path:
+    source, _, name = replay_id.partition(":")
+    if "/" in name or "\\" in name or not name.endswith(".osr"):
+        raise UserError("invalid replay")
+    folder = IMPORTED_DIR if source == "i" else replays_dir(STATE.osu_dir)
+    path = folder / name
+    if not path.exists():
+        raise UserError(f"replay not found: {name}")
+    return path
+
+
+# --- judging many plays, with progress ----------------------------------------------------------------------
+
+def gather(job: Job, label: str, last: int, player: str | None = None, select=None):
+    """Samples of the `last` most recent plays (as __main__._collect_samples), judged in parallel."""
+    from .collect import PARALLEL_MIN, _job
+    st = STATE
+    jobs = []
+    for entry in st.replays.recent(player, select):
+        if len(jobs) >= last:
+            break
+        map_path = st.index.find(entry.md5)
+        if map_path is not None:
+            jobs.append((str(st.replays.path(entry)), str(map_path)))
+    samples, taps, used = [], [], 0
+    job.step(label, 0, len(jobs))
+    if not jobs:
+        return samples, taps, used
+    pool = ProcessPoolExecutor() if len(jobs) >= PARALLEL_MIN else None
+    try:
+        results = pool.map(_job, jobs, chunksize=2) if pool else map(_job, jobs)
+        for n, result in enumerate(results, 1):
+            job.step(label, n, len(jobs))
+            if result is None:
+                continue
+            play_samples, play_taps = result
+            for s in play_samples:
+                s.play = used
+            samples += play_samples
+            taps.append(play_taps)
+            used += 1
+    finally:
+        if pool:
+            pool.shutdown(wait=False, cancel_futures=True)
+    return samples, taps, used
+
+
+def habits_for(job: Job, settings: dict, player: str | None):
+    """Samples of the recent plays for the bad habits, kept while no new replay appears."""
+    n = int(settings["habit_plays"])
+    recent = STATE.replays.recent(player)
+    key = (player or "", n, recent[0].time if recent else 0)
+    if key not in STATE.habits_cache:
+        STATE.habits_cache = {key: gather(job, "Bad habits from your recent plays", n, player)}
+    return STATE.habits_cache[key]
+
+
+def insight_json(i) -> dict:
+    return {"title": i.title, "detail": i.detail, "impact": float(i.impact), "kind": i.kind,
+            "category": i.category, "solution": "" if i.kind == "info" else solution_for(i.title, i.evidence),
+            "evidence": clean(i.evidence)}
+
+
+def split_setup(insights: list) -> dict:
+    """Setup advice split into the tablet area / sensitivity and the keyboard (rapid trigger)."""
+    area, keys = [], []
+    for i in insights:
+        (keys if "ghosts" in i.evidence or "stuck" in i.evidence else area).append(insight_json(i))
+    return {"area": area, "keys": keys}
+
+
+def trends(samples: list) -> list[dict]:
+    """Miss rate per category in the newer and older half of the recent plays (play 0 is the newest)."""
+    from .advice import category_of
+    from .coach import CATEGORY_NAMES
+    plays = max((s.play for s in samples), default=-1) + 1
+    if plays < 10:
+        return []
+    half = plays // 2
+    groups: dict[str, list[list[int]]] = {}
+    for s in samples:
+        c = category_of(s.f.pattern)
+        g = groups.setdefault(c, [[0, 0], [0, 0]])
+        side = 0 if s.play < half else 1
+        g[side][0] += s.missed
+        g[side][1] += 1
+    out = []
+    for c, ((m_new, n_new), (m_old, n_old)) in groups.items():
+        if n_new < TREND_MIN_OBJECTS or n_old < TREND_MIN_OBJECTS:
+            continue
+        new, old = m_new / n_new, m_old / n_old
+        pooled = (m_new + m_old) / (n_new + n_old)
+        se = math.sqrt(max(pooled * (1 - pooled), 1e-9) * (1 / n_new + 1 / n_old))
+        z = (new - old) / se if se else 0.0
+        out.append({"category": c, "name": CATEGORY_NAMES.get(c, c.capitalize()), "new": new, "old": old,
+                    "z": z, "trend": "worse" if z >= 2 else "better" if z <= -2 else "flat",
+                    "plays": [half, plays - half]})
+    return sorted(out, key=lambda t: -t["z"])
+
+
+# --- analysis of one replay ---------------------------------------------------------------------------------
+
+def viewer_data(beatmap, results, replay, diff, rate, samples) -> dict:
+    """What the page needs to draw the play and list its mistakes: objects (as clicked: stacked, HR-flipped), their
+    results and patterns, and the input."""
+    from .beatmap import SLIDER, SPINNER
+    by_index = {s.r.obj.index: s for s in samples}
+    objects = []
+    for r in results:
+        o = r.obj
+        x, y = o.position
+        item = {"i": o.index, "k": {SLIDER: "s", SPINNER: "p"}.get(o.kind, "c"), "t": o.time, "e": o.end_time,
+                "x": round(x, 1), "y": round(y, 1), "nc": o.new_combo, "res": r.result, "hr": r.head_result,
+                "ht": r.hit_time, "sb": r.slider_break_time, "sk": r.slider_break_kind, "why": r.miss_reason}
+        s = by_index.get(o.index)
+        if s is not None:
+            item["pat"] = s.f.pattern
+            item["dist"] = round(s.f.distance_radii, 2)
+            if s.wrong_note is not None:
+                item["why"] = "wrong_note"
+        if o.kind == SLIDER:
+            n = max(2, int(math.ceil(o.path.length / 6)))
+            item["path"] = [[round(c, 1) for c in o._transform(o.path.position_at(k / n))] for k in range(n + 1)]
+            item["rep"] = o.repeats
+        objects.append(item)
+    f = replay.frames
+    return {"objects": objects, "radius": diff.radius, "preempt": diff.preempt,
+            "fadein": 400 * min(1, diff.preempt / 450), "rate": rate, "hidden": bool(replay.mods & 8),
+            "windows": [diff.hit300, diff.hit100, diff.hit50],
+            "frames": {"t": [p.time for p in f], "x": [round(p.x, 1) for p in f], "y": [round(p.y, 1) for p in f],
+                       "k": [p.keys for p in f]}}
+
+
+def analyze(job: Job, settings: dict, replay_id: str) -> dict:
+    from .advice import HIGH_AR, ExpectedModel, build_insights, effective_ar, samples_from_play
+    from .analysis import summarize
+    from .beatmap import parse_beatmap
+    from .coach import prioritize
+    from .explain import explain_play, timestamp
+    from .features import RUN_PATTERNS, extract
+    from .judge import judge
+    from .keys import tap_stats
+    from .mods import Mods, clock_rate, mods_string
+    from .recommend import _star_key
+    from .replay import parse_replay
+    from .setup import load_setup
+    from .setup_advice import setup_insights
+
+    apply_advice_settings(settings)
+    job.step("Loading maps and replays")
+    st = STATE.load(settings)
+    path = replay_path(replay_id)
+    job.step("Reading the replay")
+    replay = parse_replay(path)
+    if replay.mode != 0:
+        raise UserError("Not an osu!standard replay.")
+    if replay.mods & (128 | 8192):
+        raise UserError("Relax/Autopilot replays are not supported.")
+    map_path = st.index.find(replay.beatmap_md5)
+    if map_path is None:
+        raise UserError("This replay's map is not in your Songs folder.")
+    beatmap = parse_beatmap(map_path)
+    job.step("Simulating the play")
+    results, diff = judge(replay, beatmap)
+    rate = clock_rate(replay.mods)
+    s = summarize(results, diff.radius, rate)
+    feats = extract(results, diff, rate, beatmap)
+    play_samples = samples_from_play(feats, diff, rate, hidden=bool(replay.mods & Mods.Hidden))
+    play_taps = tap_stats(replay.frames, results, {f.r.obj.index for f in feats if f.pattern in RUN_PATTERNS})
+    setup = load_setup()
+
+    habit_samples, habit_taps, used = habits_for(job, settings, replay.player)
+    job.step("Looking for mistakes")
+    setup_found = setup_insights(habit_samples, habit_taps, setup) if habit_samples else []
+    insights = build_insights(habit_samples) + setup_found if habit_samples else []
+    model = ExpectedModel(habit_samples) if habit_samples else None
+    normal_ar = [x for x in habit_samples if x.ar <= HIGH_AR]
+    normal_ar_model = ExpectedModel(normal_ar) if len(normal_ar) >= 1000 else None
+    episodes = explain_play(play_samples, replay.frames, diff.radius, model, normal_ar_model, play_taps)
+    priorities = prioritize(episodes, insights, play_samples, habit_samples)
+
+    info = st.infos.get(replay.beatmap_md5)
+    c = s.counts
+    trend = trends(habit_samples)
+    worse = {t["category"]: t for t in trend}
+    training = []
+    for p in priorities:
+        skill = TRAIN_SKILL.get(p.category)
+        if not skill or p.map_score < 10 and (p.habits_score or 0) < 15:
+            continue
+        t = worse.get(p.category)
+        why = f"{p.map_score:.0f}% of this play's mistakes"
+        if p.habits_score:
+            why += f", {p.habits_score:.0f}% of your bad habits"
+        if t and t["trend"] == "worse":
+            why += f"; getting worse ({t['old']:.1%} → {t['new']:.1%} misses in recent plays)"
+        training.append({"category": p.category, "name": p.name, "skill": skill,
+                         "skill_name": SKILL_NAMES.get(skill, skill), "why": why,
+                         "dt": p.category == "dt"})
+    for t in trend:
+        skill = TRAIN_SKILL.get(t["category"])
+        if t["trend"] == "worse" and skill and all(x["category"] != t["category"] for x in training):
+            training.append({"category": t["category"], "name": t["name"], "skill": skill,
+                             "skill_name": SKILL_NAMES.get(skill, skill),
+                             "why": f"getting worse: {t['old']:.1%} → {t['new']:.1%} misses in recent plays",
+                             "dt": t["category"] == "dt"})
+
+    return clean({
+        "map": {"name": beatmap.display_name, "mods": mods_string(replay.mods), "player": replay.player,
+                "stars": (info.stars.get(_star_key(replay.mods)) or info.stars.get(0)) if info else None,
+                "beatmap_id": info.beatmap_id if info and info.beatmap_id > 0 else None,
+                "set_id": info.set_id if info and info.set_id > 0 else None,
+                "cs": diff.cs, "ar": effective_ar(diff, rate), "od": diff.od, "rate": rate},
+        "stats": {"c300": replay.count_300, "c100": replay.count_100, "c50": replay.count_50,
+                  "miss": replay.count_miss, "sim": [c[300], c[100], c[50], c[0]],
+                  "combo": replay.max_combo, "acc": accuracy({"c300": replay.count_300, "c100": replay.count_100,
+                                                              "c50": replay.count_50, "miss": replay.count_miss}),
+                  "ur": s.unstable_rate, "mean_error": s.mean_error, "early": s.mean_early, "late": s.mean_late,
+                  "aim_distance": s.aim_mean_distance, "slider_breaks": s.slider_breaks},
+        "habit_plays": used,
+        "priorities": [{
+            "category": p.category, "name": p.name, "map_score": p.map_score, "habits_score": p.habits_score,
+            "content": p.content, "play_rate": p.play_rate, "usual_rate": p.usual_rate, "rate_label": p.rate_label,
+            "insights": [insight_json(i) for i in p.insights],
+            "episodes": [{"time": e.time, "stamp": timestamp(e.time), "title": e.title, "reasons": e.reasons,
+                          "cost": e.cost} for e in p.episodes],
+        } for p in priorities],
+        "setup": split_setup(setup_found),
+        "setup_desc": setup.describe(),
+        "training": training,
+        "trends": trend,
+        "viewer": viewer_data(beatmap, results, replay, diff, rate, play_samples),
+    })
+
+
+# --- the player profile ---------------------------------------------------------------------------------------
+
+def skill_json(skill) -> dict:
+    from .skills import describe
+    d = clean(asdict(skill))
+    d.pop("model", None)
+    d["text"] = describe(skill)
+    return d
+
+
+def load_profile() -> dict:
+    from .skills import SKILLS_PATH
+    out = {"skills": None, "habits": None, "skillsets": None}
+    try:
+        data = json.loads(SKILLS_PATH.read_text(encoding="utf-8"))
+        out["skills"] = {"plays": data.get("plays"), "updated": SKILLS_PATH.stat().st_mtime,
+                         "skills": [{k: v for k, v in s.items() if k != "model"} for s in data.get("skills", [])]}
+    except (OSError, ValueError):
+        pass
+    try:
+        out["skillsets"] = json.loads(SKILLSETS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    try:
+        out["habits"] = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+        for i in out["habits"].get("habits", []):   # from the current texts, not the ones saved with the profile
+            i["solution"] = "" if i.get("kind") == "info" else solution_for(i["title"], i.get("evidence"))
+        refresh_setup_advice(out["habits"])
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def refresh_setup_advice(habits: dict):
+    """The area and key advice again from what the plays measured, with the current cutoffs and setup: changing
+    either in Settings shows at once, without judging the plays again."""
+    from .setup import load_setup
+    from .setup_advice import advise
+    try:
+        measured = json.loads(SETUP_STATS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    apply_advice_settings(load_settings())
+    setup = load_setup()
+    found = advise(measured, setup)
+    habits["setup"] = split_setup(found)
+    habits["setup_desc"] = setup.describe()
+    kept = [i for i in habits.get("habits", []) if i.get("category") != "setup"]
+    habits["habits"] = sorted(kept + [insight_json(i) for i in found if i.kind != "info"], key=lambda i: -i["impact"])
+
+
+def build_player_profile(job: Job, settings: dict) -> dict:
+    from .advice import build_insights, is_high_ar, is_low_ar
+    from .setup import load_setup
+    from .setup_advice import advise, measure
+    from . import skillsets
+    from .skills import build_profile, save_profile
+    apply_advice_settings(settings)
+    job.step("Loading maps and replays")
+    STATE.load(settings)
+    n_skill, n_habit = int(settings["skill_plays"]), int(settings["habit_plays"])
+    samples, taps, used = gather(job, "Recent plays", max(n_skill, n_habit))
+    low, _, low_used = gather(job, "Plays below AR 9 (reading)", n_skill, select=lambda e: is_low_ar(e.ar))
+    high, _, high_used = gather(job, "Plays above AR 10", n_skill, select=lambda e: is_high_ar(e.ar))
+    for offset, extra in ((100_000, low), (200_000, high)):
+        for s in extra:
+            s.play += offset
+    job.step("Computing your level per skillset")
+    skill_samples = [s for s in samples if s.play < n_skill]
+    skills = build_profile(skill_samples, low, high)
+    save_profile(skills, min(used, n_skill), None)
+    tolerance = float(settings["skills"]["stream_ur_tolerance_pct"]) / 100
+    SKILLSETS_PATH.write_text(json.dumps(clean({**skillsets.build(skill_samples, tolerance), "updated": time.time()})),
+                              encoding="utf-8")
+    job.step("Looking for bad habits")
+    habit_samples = [s for s in samples if s.play < n_habit]
+    setup = load_setup()
+    measured = measure(habit_samples, taps[:n_habit])
+    SETUP_STATS_PATH.write_text(json.dumps(clean({"clicks": measured["clicks"].round(2).tolist(), "taps": measured["taps"]})),
+                                encoding="utf-8")
+    setup_found = advise(measured, setup)
+    insights = build_insights(habit_samples) + setup_found
+    habits = [i for i in insights if i.kind != "info"]
+    habits.sort(key=lambda i: -i.impact)
+    notes = [i for i in insights if i.kind == "info"]
+    data = clean({
+        "updated": time.time(), "plays": min(used, n_habit), "objects": len(habit_samples),
+        "misses": sum(s.missed for s in habit_samples), "setup_desc": setup.describe(),
+        "habits": [insight_json(i) for i in habits], "notes": [insight_json(i) for i in notes],
+        "setup": split_setup(setup_found),
+        "trends": trends(samples), "extra_plays": [low_used, high_used],
+    })
+    PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROFILE_PATH.write_text(json.dumps(data), encoding="utf-8")
+    return load_profile()
+
+
+# --- beatmap search -----------------------------------------------------------------------------------------
+
+def _range(r) -> tuple[float | None, float | None]:
+    if not r:
+        return None, None
+    lo, hi = r
+    return (None if lo is None else float(lo)), (None if hi is None else float(hi))
+
+
+def _base_ar(ar: float, rate: float) -> float:
+    """The map's AR that plays as `ar` at this clock rate."""
+    from .skills import ar_from_preempt
+    preempt = 1200 - 150 * (ar - 5) if ar >= 5 else 1200 + 120 * (5 - ar)
+    return ar_from_preempt(preempt * rate)
+
+
+def site_query(stars, ranges: dict, rate: float) -> str:
+    """The site's search filters for the ranges as played at this rate (DT: 1.5), a little wider than the ranges:
+    the site filters beatmapsets (a set passes if one difficulty does), each difficulty is checked afterwards.
+    Only the minimum length: the site's is the total length, the ranges' the drain one."""
+    from . import online
+    factor = online.DT_SR_FACTOR if rate > 1 else 1.0
+    words = []
+    for key, lo, hi, conv, digits, pad in (
+            ("stars", *stars, lambda v: v / factor, 2, 0.0),
+            ("bpm", *ranges.get("bpm", (None, None)), lambda v: v / rate, 0, 1.0),
+            ("ar", *ranges.get("ar", (None, None)), lambda v: _base_ar(v, rate), 1, 0.1),
+            ("od", *ranges.get("od", (None, None)), lambda v: (80 - (80 - 6 * v) * rate) / 6, 1, 0.1),
+            ("cs", *ranges.get("cs", (None, None)), lambda v: v, 1, 0.1),
+            ("length", ranges.get("length", (None, None))[0], None, lambda v: v * rate, 0, 1.0)):
+        if lo is not None:
+            words.append(f"{key}>={conv(lo) - pad:.{digits}f}")
+        if hi is not None:
+            words.append(f"{key}<={conv(hi) + pad:.{digits}f}")
+    return " ".join(words)
+
+
+def name_relevance(m, words: list[str]) -> float:
+    """How well a map's name matches the searched words: the whole text as the title first, then in the title,
+    then each word in the title, the artist, the difficulty and the mapper."""
+    if not words:
+        return 0.0
+    phrase = " ".join(words)
+    fields = ((m.title.lower(), 10.0), (m.artist.lower(), 6.0), (m.version.lower(), 4.0), (m.creator.lower(), 3.0))
+    score = 100.0 if fields[0][0] == phrase else 50.0 if phrase in fields[0][0] else 0.0
+    score += 25.0 if any(phrase in f for f, _ in fields[1:]) else 0.0
+    for w in words:
+        for text, weight in fields:
+            if re.search(rf"(?<!\w){re.escape(w)}(?!\w)", text):
+                score += weight          # a whole word
+            elif len(w) >= 3 and w in text:
+                score += weight / 2      # part of a word ("to" inside "Haruto" isn't a match)
+    return score
+
+
+def map_skills(a: dict, min_share: float) -> set[str]:
+    """The skillsets a map is tagged with: its main type, every kind with at least `min_share` of the intense notes
+    (tech: of the notes), and the aim control / reading / speed / precision tags."""
+    from . import maptypes
+    from . import recommend as rc
+    share = {**a, "tech": a["tech sliders"]}
+    names = {part.strip().lower() for part in maptypes.category(a).split("+")}
+    names |= {maptypes.NAMES[k].lower() for k in maptypes.KINDS if share[k] >= min_share}
+    return {sk for sk in rc.SKILLS if (rc.SKILLS[sk][0] in names if rc.SKILLS[sk][0] else rc.has_skill(a, sk))}
+
+
+def search_maps(job: Job, settings: dict, q: dict) -> dict:
+    """Maps having every included type and none of the excluded ones, in the ranges (cmd_search, with
+    exclusions): from Songs or from the osu! site (downloaded and read), with their real type."""
+    from . import maptypes
+    from . import recommend as rc
+    from .mods import Mods, mods_string
+    include = [s for s in q.get("include", []) if s in rc.SKILLS]
+    exclude = [s for s in q.get("exclude", []) if s in rc.SKILLS and s not in include]
+    # words of the artist, title, difficulty or mapper (no "<", ">", "=": the site would read them as filters)
+    words = re.sub(r"[<>=]", " ", str(q.get("text") or "")).lower().split()
+    # per skillset: included ones with at least this share of the intense notes, excluded ones with at most this
+    # (none given: "any", the tag decides)
+    share_key = {"stream": "stream", "jump": "jump", "alt": "alt", "finger control": "finger", "tech": "tech sliders"}
+    at_least = {sk: float(v) / 100 for sk, v in (q.get("min_share") or {}).items() if sk in include and sk in share_key and v}
+    at_most = {sk: float(v) / 100 for sk, v in (q.get("max_share") or {}).items()
+               if sk in exclude and sk in share_key and v is not None and float(v) < 100}
+
+    def wanted(a: dict, tagged: set) -> bool:
+        for sk in include:
+            if sk not in tagged or (sk in at_least and a[share_key[sk]] < at_least[sk]):
+                return False
+        for sk in exclude:
+            if (a[share_key[sk]] > at_most[sk]) if sk in at_most else sk in tagged:
+                return False
+        return True
+    try:
+        mod_sets = rc.parse_mods(",".join(q.get("mods") or ["NM"]))
+    except ValueError as e:
+        raise UserError(str(e))
+    ranges = {k: _range(q.get(k)) for k in ("ar", "cs", "od", "length", "bpm")}
+    ranges = {k: v for k, v in ranges.items() if v != (None, None)}
+    stars = _range(q.get("stars"))
+    limit = max(1, int(q.get("limit") or 30))
+    max_pages = max(1, int(q.get("max_pages") or settings["search"]["max_pages"]))
+    # where (the site, the Songs folder or both) and which statuses (ranked, loved, other: Songs only)
+    sources = q.get("source") or ["online"]
+    sources = [sources] if isinstance(sources, str) else sources
+    chosen = q.get("status") or ["ranked"]
+    if isinstance(chosen, str):   # older settings: "ranked", "loved" (ranked and loved) or "any"
+        chosen = {"loved": ["ranked", "loved"], "any": ["ranked", "loved", "other"]}.get(chosen, ["ranked"])
+    statuses = tuple(code for name, codes in (("ranked", rc.ACCEPTED_STATUS), ("loved", (rc.LOVED_STATUS,)),
+                                              ("other", (0, 1, 2, 3, 6))) if name in chosen for code in codes)
+    site_statuses = [x for x in ("ranked", "loved") if x in chosen]
+
+    def star_ok(s):
+        return s is not None and (stars[0] is None or s >= stars[0] - 1e-6) and (stars[1] is None or s <= stars[1] + 1e-6)
+
+    job.step("Loading maps")
+    st = STATE.load(settings)
+    found = []
+    tag_min = float(settings["search"]["tag_min_pct"]) / 100
+    maptypes.TOP_KIND_MIN, maptypes.TOP_KINDS_SHOWN = tag_min, len(maptypes.KINDS)   # the label lists what is tagged
+
+    row = map_row
+
+    note = ""
+    if "songs" in sources:
+        items = [(m, mods) for m in st.maps if m.mode == 0 and m.status in statuses and m.drain_s >= rc.MIN_DRAIN_S
+                 and (not q.get("unplayed") or m.unplayed)
+                 and all(w in f"{m.artist} {m.title} {m.version} {m.creator}".lower() for w in words) for mods in mod_sets
+                 if star_ok(m.stars.get(rc._star_key(mods))) and rc.in_ranges(m, mods, ranges)]
+
+        def progress(label, n, total):
+            job.step(f"Reading the map types in Songs ({len(items)} match the filters)", n, total)
+        kinds = maptypes.types(songs_dir(st.osu_dir), items, progress)
+        for m, mods in items:
+            a = kinds.get(f"{m.md5}:{mods}")
+            tagged = map_skills(a, tag_min) if a else set()
+            if a and wanted(a, tagged):
+                share = rc.skill_share(a, include[0]) if include else 0.0
+                tags = [sk for sk in rc.SKILLS if sk in tagged]
+                found.append(dict(row(share, m, mods, maptypes.label(a), tags, True),
+                                  relevance=name_relevance(m, words)))
+    if "online" in sources and site_statuses:
+        songs_found, found = found, []   # each source finds up to the limit; merged and sorted at the end
+        from . import api, online, typeguess
+        try:
+            client = api.OsuApi()
+        except api.ApiError as e:
+            raise UserError(f"osu! API: {e}. Set it up in Settings.")
+        guessed = rc.load_predicted()
+        local = {m.md5 for m in st.maps}
+        searches = []
+        for mods in mod_sets:
+            if mods & ~int(Mods.DoubleTime):
+                continue    # the site's filters and the guesses are for nomod and DT only
+            name, rate = ("DT", 1.5) if mods & Mods.DoubleTime else ("NM", 1.0)
+            query = " ".join(words + [site_query(stars, ranges, rate)]).strip()   # the site matches tags too
+            for site_status in site_statuses:     # ranked and loved are separate searches on the site
+                searches.append({"mods": mods, "name": name, "query": query, "status": site_status, "cursor": None,
+                                 "done": False, "next": None})
+        if not searches and "songs" not in sources:
+            raise UserError("Only NM and DT can be searched on the site.")
+        seen, examined, pages, downloaded = set(), 0, 0, 0
+        site_rank: dict[tuple, int] = {}
+        unlikely = []    # maps whose guess says they lack an included skillset as their type
+        songs = songs_dir(st.osu_dir)
+        job.partial = []
+        files = api.OsuFiles(client)
+        pager = ThreadPoolExecutor(1)    # the next result page is asked for while this one is being read
+
+        def progress():
+            job.step(f"Pages read {pages}/{max_pages}: {examined} maps match the filters, {downloaded} downloaded and "
+                     f"read, {len(found)} found", len(found), limit)
+
+        def classify(cands):
+            """The candidates' .osu downloaded (cached) and read for real, ten at a time until enough are found,
+            the next ten downloading while these are read; every real type is kept for the guesser."""
+            nonlocal downloaded
+            batches = [cands[i:i + 10] for i in range(0, len(cands), 10)]
+            pending = [files.submit(info.beatmap_id, info.md5) for info, _, _ in batches[0]] if batches else []
+            for n, batch in enumerate(batches):
+                if len(found) >= limit:
+                    break
+                current = pending
+                pending = ([files.submit(info.beatmap_id, info.md5) for info, _, _ in batches[n + 1]]
+                           if n + 1 < len(batches) else [])
+                got = []
+                for (info, mods, bs), fut in zip(batch, current):
+                    job.check()
+                    try:
+                        info.path = str(fut.result())
+                    except Exception:
+                        continue
+                    downloaded += 1
+                    got.append((info, mods, bs))
+                progress()
+                kinds = maptypes.types(songs, [(m, mods) for m, mods, _ in got])
+                typeguess.remember([(m, mods, kinds.get(f"{m.md5}:{mods}")) for m, mods, _ in got])
+                for m, mods, bs in got:
+                    a = kinds.get(f"{m.md5}:{mods}")
+                    tagged = map_skills(a, tag_min) if a else set()
+                    if not a or not wanted(a, tagged):
+                        continue
+                    share = rc.skill_share(a, include[0]) if include else 0.0
+                    tags = [sk for sk in rc.SKILLS if sk in tagged]
+                    r = row(share, m, mods, maptypes.label(a), tags, False)
+                    r["rank"] = site_rank[(m.beatmap_id, mods)]
+                    r["relevance"] = name_relevance(m, words)
+                    r["preview"] = bs.get("covers", {}).get("list")
+                    found.append(r)
+                    job.partial = (songs_found + found)[:limit]
+            for fut in pending:
+                fut.cancel()
+
+        try:
+            while len(found) < limit and pages < max_pages and not all(x["done"] for x in searches):
+                for x in searches:
+                    if x["done"] or len(found) >= limit or pages >= max_pages:
+                        continue
+                    progress()
+                    try:
+                        page = (x["next"] or pager.submit(client.search, x["query"], x["status"], x["cursor"])).result()
+                    except api.ApiError as e:
+                        raise UserError(f"osu! API: {e}")
+                    pages += 1
+                    x["cursor"] = page.get("cursor_string")
+                    x["done"] = not x["cursor"]
+                    x["next"] = (pager.submit(client.search, x["query"], x["status"], x["cursor"])
+                                 if x["cursor"] and pages < max_pages else None)
+                    mods, name = x["mods"], x["name"]
+                    sure, maybe = [], []
+                    for bs in page.get("beatmapsets", []):
+                        for bm in bs.get("beatmaps", []):
+                            if bm.get("mode_int", 0) != 0 or bm.get("checksum") in local or (bm["id"], mods) in seen:
+                                continue
+                            seen.add((bm["id"], mods))
+                            site_rank[(bm["id"], mods)] = len(site_rank)   # the site's order: by relevance with a name
+                            info = online._info(bm, bs)
+                            if not star_ok(info.stars.get(rc._star_key(mods))) or not rc.in_ranges(info, mods, ranges) \
+                                    or info.drain_s < rc.MIN_DRAIN_S:
+                                continue
+                            examined += 1
+                            if maptypes.too_easy(info.stars.get(0)):
+                                continue    # no type under 3 stars: nothing to find
+                            # the guess only sorts: sure excluded skipped, sure yes read first, the rest after; a sure
+                            # no only means "not its main type", and a smaller share can still get the tag: read last
+                            p = guessed.get(f"{bm['id']}:{name}") or typeguess.guess(bm, bs, name)
+                            said = [rc.predicted_skill(p, sk) for sk in include]
+                            if any(rc.predicted_skill(p, sk) is True for sk in exclude):
+                                continue
+                            (unlikely if False in said else sure if said and all(said) else maybe).append((info, mods, bs))
+                    classify(sure + maybe)
+            classify(unlikely)    # only while more maps are needed (classify stops at the limit)
+        finally:
+            files.close()
+            pager.shutdown(wait=False, cancel_futures=True)
+        note = "" if len(found) >= limit or not searches else (
+            "No more results on the site." if all(x["done"] for x in searches)
+            else f"Stopped at {max_pages} pages: raise the search depth in Settings to look further.")
+        found = songs_found + found
+    if words:   # a name: the best matches first, from both sources alike (ties: the site's order), then the skillset
+        found.sort(key=lambda f: (-f.get("relevance", 0.0), f.get("rank", 0), -f["share"]))
+    else:
+        found.sort(key=lambda f: -f["share"])
+    return clean({"maps": found[:limit], "total": len(found), "note": note})
+
+
+def player_model(job: Job, settings: dict):
+    """The unified model of the player's misses (model.py): the saved one, else fitted on the recent plays plus the
+    plays below AR 9 and above AR 10, as `osu_coach model` does."""
+    from . import model as um
+    from .advice import is_high_ar, is_low_ar
+    fitted = um.load()
+    if fitted is not None and fitted.usual_rate and fitted.stream_runs:
+        return fitted
+    n = int(settings["skill_plays"])
+    samples, _, _ = gather(job, "Recent plays, for your model", n)
+    extra = []
+    for offset, label, select in ((100_000, "Plays below AR 9", lambda e: is_low_ar(e.ar)),
+                                  (200_000, "Plays above AR 10", lambda e: is_high_ar(e.ar))):
+        more, _, _ = gather(job, label, n, select=select)
+        for s in more:
+            s.play += offset
+        extra += more
+    job.step("Fitting your model")
+    fitted = um.fit(samples + extra, chain_samples=samples)
+    if fitted is None:
+        raise UserError("Not enough plays to fit your model yet.")
+    parts = um.breakdown(fitted, samples)
+    um.set_usual(fitted, parts)
+    um.set_stream_runs(fitted, samples)
+    um.save(fitted)
+    return fitted
+
+
+def recommend_maps(job: Job, settings: dict, q: dict) -> dict:
+    """Maps made to train the included skillsets (none: the three that cost the player most), a step above their
+    level: `osu_coach recommend`, from the Songs folder and/or the osu! site, as a ladder per skillset."""
+    from . import maptypes
+    from . import recommend as rc
+    from .mods import Mods, mods_string
+    job.step("Loading maps and replays")
+    st = STATE.load(settings)
+    try:
+        mod_sets = rc.parse_mods(",".join(q.get("mods") or ["NM"]))
+    except ValueError as e:
+        raise UserError(str(e))
+    sources = q.get("source") or ["online"]
+    sources = [sources] if isinstance(sources, str) else sources
+    chosen = q.get("status") or ["ranked"]
+    chosen = [chosen] if isinstance(chosen, str) else chosen
+    statuses = tuple(code for name, codes in (("ranked", rc.ACCEPTED_STATUS), ("loved", (rc.LOVED_STATUS,)),
+                                              ("other", (0, 1, 2, 3, 6))) if name in chosen for code in codes)
+    per_skill = max(1, int(q.get("limit") or 15))
+
+    model = player_model(job, settings)
+    share = lambda sk: model.usual_shares.get(rc.SKILLS[sk][1], 0.0)
+    targets = [s for s in q.get("include", []) if s in rc.SKILLS] or sorted(rc.SKILLS, key=lambda sk: -share(sk))[:3]
+    infos = {m.md5: m for m in st.maps}
+    owner_plays = st.replays.recent()
+    band = rc.star_band(infos, [(e.md5, e.mods) for e in owner_plays[:int(settings["skill_plays"])]])
+    if band is None:
+        raise UserError("Not enough recent plays on maps with known star ratings to know your level.")
+
+    def progress(label, n, total):
+        job.step(label[:1].upper() + label[1:], n, total)
+
+    items = []
+    if "songs" in sources:
+        items = rc.candidates(st.maps, {e.md5 for e in owner_plays}, band, mod_sets, statuses)
+    if "online" in sources:
+        from . import api, online, typeguess
+        try:
+            client = api.OsuApi()
+        except api.ApiError as e:
+            raise UserError(f"osu! API: {e}. Set it up in Settings.")
+        keys = list(dict.fromkeys(rc.ONLINE_KEY.get(sk, "other") for sk in targets))
+        guessed = rc.load_predicted()
+
+        def verdict(found, key):
+            """The guessed type's answer for the skills searched under this key (see cmd_recommend)."""
+            name = "DT" if found.mods & Mods.DoubleTime else "NM"
+            p = guessed.get(f"{found.info.beatmap_id}:{name}")
+            if p is None and found.bm is not None:
+                p = typeguess.guess(found.bm, found.bs, name)
+            said = [rc.predicted_skill(p, sk) for sk in targets if rc.ONLINE_KEY.get(sk, "other") == key]
+            return True if True in said else False if said and all(s is False for s in said) else None
+        use_guess = bool(guessed) or typeguess.available()
+        try:
+            items += online.discover(client, keys, st.maps, band, rc.tap_window(model), mod_sets,
+                                     {e.md5 for e in owner_plays} | set(infos), pages=10, per_skill=150,
+                                     progress=progress, verdict=verdict if use_guess else None)
+        except api.ApiError as e:
+            raise UserError(f"osu! API: {e}")
+
+    songs = songs_dir(st.osu_dir)
+    content = rc.contents(songs, items, progress)
+    kinds = maptypes.types(songs, items, progress)
+    short = {sk: rc.skill_candidates(sk, items, kinds, content, model) for sk in targets}
+    to_profile = list({(m.md5, mods): (m, mods) for sk in targets for m, mods in short[sk]}.values())
+    job.step("Predicting how each map would go for you", 0, len(to_profile))
+    profs = rc.profiles(model, songs, to_profile, progress)
+    tag_min = float(settings["search"]["tag_min_pct"]) / 100
+    maptypes.TOP_KIND_MIN, maptypes.TOP_KINDS_SHOWN = tag_min, len(maptypes.KINDS)
+    found = []
+    for sk in targets:
+        for n, k in enumerate(rc.ladder(sk, short[sk], kinds, content, profs, model, size=per_skill)):
+            a = kinds.get(f"{k.info.md5}:{k.mods}")
+            local = k.info.md5 in infos
+            r = map_row(k.score, k.info, k.mods, maptypes.label(a) if a else "", sorted(map_skills(a, tag_min)) if a else [],
+                        local)
+            # why this map: the second part of the recommender's own line
+            r["why"] = rc.describe_pick(k, sk).split("\n")[0].split("  ")[-1]
+            r["group"] = f"{SKILL_NAMES.get(sk, sk)}: {share(sk):.0%} of your misses usually"
+            r["step"] = n + 1
+            found.append(r)
+    note = "" if found else "No map found that trains these skillsets at your level: add a source or a status."
+    return clean({"maps": found, "total": len(found), "note": note, "recommended": True,
+                  "band": [round(band[0], 2), round(band[1], 2)]})
+
+
+def map_row(share, m, mods, label, tags, local) -> dict:
+    """A map as the search page shows it."""
+    from . import recommend as rc
+    from .mods import mods_string
+    v = rc.effective_values(m, mods)
+    return {"share": share, "name": m.display_name, "artist": m.artist, "title": m.title, "version": m.version,
+            "creator": m.creator, "mods": mods_string(mods) if mods else "NM",
+            "stars": m.stars.get(rc._star_key(mods)) or 0.0, "bpm": v["bpm"], "ar": v["ar"], "cs": v["cs"],
+            "od": v["od"], "length": v["length"], "label": label, "tags": tags, "local": local,
+            "beatmap_id": m.beatmap_id if m.beatmap_id > 0 else None, "set_id": m.set_id if m.set_id > 0 else None}
+
+
+def elo_plays(job: Job, settings: dict) -> list[dict]:
+    """The challenges of the owner's plays of the last 90 days and the month before (elo.py), judging only the plays
+    not seen before; the rest comes from elo_plays.json."""
+    from . import elo
+    from .collect import PARALLEL_MIN
+    st = STATE.load(settings)
+    since = time.time() - (elo.DAYS + elo.WARMUP_DAYS) * 86400
+    entries = [e for e in st.replays.recent() if e.time >= since]
+    known = elo.load_plays()
+    todo = []
+    for e in entries:
+        if e.name not in known:
+            map_path = st.index.find(e.md5)
+            if map_path is not None:
+                todo.append((e, (str(st.replays.path(e)), str(map_path))))
+    job.step("Reading your plays for the ratings", 0, len(todo))
+    if todo:
+        pool = ProcessPoolExecutor() if len(todo) >= PARALLEL_MIN else None
+        try:
+            results = pool.map(elo.play_job, [a for _, a in todo], chunksize=2) if pool else map(elo.play_job, [a for _, a in todo])
+            for n, ((e, _), res) in enumerate(zip(todo, results), 1):
+                job.step("Reading your plays for the ratings", n, len(todo))
+                known[e.name] = {"time": e.time, "skills": res or {}}
+                if n % 50 == 0:
+                    elo.save_plays(known)
+        finally:
+            if pool:
+                pool.shutdown(wait=False, cancel_futures=True)
+        elo.save_plays(known)
+    names = {e.name for e in entries}
+    return [p for name, p in known.items() if name in names]
+
+
+def elo_history(job: Job, settings: dict) -> dict:
+    from . import elo
+    plays = elo_plays(job, settings)
+    job.step("Computing the ratings")
+    data = clean({**elo.history(plays), "updated": time.time(), "plays": len(plays)})
+    ELO_PATH.write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+def load_elo() -> dict | None:
+    try:
+        return json.loads(ELO_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+# --- downloads --------------------------------------------------------------------------------------------------
+
+def download_sets(job: Job, settings: dict, sets: list[dict]) -> dict:
+    """.osz of each beatmapset into Songs (osu! imports them at the next start or F5 in song select)."""
+    st = STATE.load(settings)
+    target = songs_dir(st.osu_dir)
+    mirror = settings["search"]["mirror"] or DEFAULT_SETTINGS["search"]["mirror"]
+    done, failed = [], []
+    for n, s in enumerate(sets):
+        set_id = int(s["set_id"])
+        name = re.sub(r'[<>:"/\\|?*]', "", f"{set_id} {s.get('artist', '')} - {s.get('title', '')}").strip()
+        job.step(f"Downloading {name}", n, len(sets))
+        path = target / f"{name}.osz"
+        if path.exists() or any(target.glob(f"{set_id} *")):
+            done.append(set_id)
+            continue
+        try:
+            req = urllib.request.Request(mirror.format(set_id=set_id), headers={"User-Agent": "osu-coach"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                if "html" in (resp.headers.get("Content-Type") or "") or "json" in (resp.headers.get("Content-Type") or ""):
+                    raise OSError("the mirror doesn't have this map")
+                tmp = path.with_suffix(".part")
+                with open(tmp, "wb") as f:
+                    while chunk := resp.read(1 << 16):
+                        job.check()
+                        f.write(chunk)
+            tmp.replace(path)
+            done.append(set_id)
+        except Cancelled:
+            path.with_suffix(".part").unlink(missing_ok=True)
+            raise
+        except Exception as e:
+            path.with_suffix(".part").unlink(missing_ok=True)
+            failed.append({"set_id": set_id, "error": str(e)})
+    job.step("Done", len(sets), len(sets))
+    return {"done": done, "failed": failed, "folder": str(target)}
+
+
+# --- API credentials ------------------------------------------------------------------------------------------
+
+def api_status() -> dict:
+    from . import api
+    creds = api.load_credentials()
+    return {"client_id": creds.get("client_id") or "", "has_secret": bool(creds.get("client_secret"))}
+
+
+def api_save(body: dict) -> dict:
+    from . import api
+    creds = api.load_credentials()
+    if "client_id" in body:
+        creds["client_id"] = str(body["client_id"]).strip()
+    if body.get("client_secret"):
+        creds["client_secret"] = str(body["client_secret"]).strip()
+    api.save_credentials({"client_id": creds.get("client_id"), "client_secret": creds.get("client_secret")})
+    return api_status()
+
+
+def api_test() -> dict:
+    from . import api
+    try:
+        client = api.OsuApi()
+        page = client.get("/beatmapsets/search", {"q": "stars>=6 stars<=7", "m": 0, "s": "ranked"}, ttl=0)
+        sets = page.get("beatmapsets", [])
+        return {"ok": True, "message": f"Working: {len(sets)} beatmapsets on the first search page."}
+    except api.ApiError as e:
+        return {"ok": False, "message": str(e)}
+
+
+def setup_get() -> dict:
+    from .setup import load_setup
+    s = load_setup()
+    return {**asdict(s), "describe": s.describe()}
+
+
+def setup_save(body: dict) -> dict:
+    from .setup import CONFIG_PATH, Setup, save_setup
+    try:
+        saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    for key in ("device", "keyboard"):
+        if key in body:
+            saved[key] = body[key] or None
+    for key in ("area_w", "area_h", "sens", "rt_press", "rt_release", "actuation", "dpi"):
+        if key in body:
+            v = body[key]
+            saved[key] = (int(v) if key == "dpi" else float(v)) if v not in (None, "") else None
+    save_setup(Setup(**{k: v for k, v in saved.items() if k in Setup.__dataclass_fields__ and v is not None}))
+    return setup_get()
+
+
+# --- JSON and HTTP ----------------------------------------------------------------------------------------------
+
+def clean(x):
+    """Plain JSON values: numpy numbers, tuples, dataclasses, non-finite floats (as null)."""
+    if isinstance(x, dict):
+        return {str(k): clean(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [clean(v) for v in x]
+    if is_dataclass(x) and not isinstance(x, type):
+        return clean(asdict(x))
+    if hasattr(x, "item") and callable(x.item):
+        x = x.item()
+    if isinstance(x, float) and not math.isfinite(x):
+        return None
+    if isinstance(x, Path):
+        return str(x)
+    return x
+
+
+LAST_PING = [time.time()]
+STATIC_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
+                ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, data, code: int = 200):
+        self._send(code, json.dumps(clean(data)).encode("utf-8"), "application/json")
+
+    def _body(self) -> bytes:
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        try:
+            if url.path.startswith("/api/"):
+                return self._json(self.api_get(url.path[5:], urllib.parse.parse_qs(url.query)))
+            rel = "index.html" if url.path in ("", "/") else url.path.lstrip("/")
+            path = (UI_DIR / rel).resolve()
+            if UI_DIR not in path.parents or not path.is_file():
+                return self._send(404, b"not found", "text/plain")
+            self._send(200, path.read_bytes(), STATIC_TYPES.get(path.suffix, "application/octet-stream"))
+        except UserError as e:
+            self._json({"error": str(e)}, 400)
+        except Exception as e:
+            traceback.print_exc()
+            self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+
+    def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        try:
+            if url.path == "/api/import":
+                return self._json(import_replay(urllib.parse.parse_qs(url.query).get("name", ["replay.osr"])[0],
+                                                self._body()))
+            body = json.loads(self._body() or b"{}")
+            self._json(self.api_post(url.path[5:], body))
+        except UserError as e:
+            self._json({"error": str(e)}, 400)
+        except Exception as e:
+            traceback.print_exc()
+            self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+
+    def api_get(self, route: str, q: dict):
+        LAST_PING[0] = time.time()
+        settings = load_settings()
+        if route == "ping":
+            return {"ok": True}
+        if route == "state":
+            from .recommend import SKILLS
+            osu = settings["osu_dir"] or str(default_osu_dir() or "")
+            return {"settings": settings, "defaults": DEFAULT_SETTINGS, "osu_dir": osu, "api": api_status(),
+                    "setup": setup_get(), "skills": list(SKILLS),
+                    "skill_names": SKILL_NAMES, "first_run": not SETTINGS_PATH.exists()}
+        if route == "detect":
+            return detect()
+        if route == "replays":
+            if q.get("reload"):
+                STATE.load(settings, force=True)
+            return replay_rows(settings)
+        if route == "profile":
+            return load_profile()
+        if route == "elo":
+            return {"elo": load_elo()}
+        if route.startswith("job/"):
+            job = JOBS.get(route[4:])
+            if not job:
+                raise UserError("unknown job")
+            return job.public()
+        raise UserError(f"unknown: {route}")
+
+    def api_post(self, route: str, body: dict):
+        settings = load_settings()
+        if route == "analyze":
+            return start_job("analyze", lambda job: analyze(job, settings, body["id"])).public()
+        if route == "profile":
+            return start_job("profile", lambda job: build_player_profile(job, settings)).public()
+        if route == "elo":
+            return start_job("elo", lambda job: elo_history(job, settings)).public()
+        if route == "search":
+            work = recommend_maps if body.get("recommended") else search_maps
+            return start_job("search", lambda job: work(job, settings, body)).public()
+        if route == "download":
+            return start_job("download", lambda job: download_sets(job, settings, body["sets"])).public()
+        if route.startswith("job/") and route.endswith("/cancel"):
+            job = JOBS.get(route[4:-7])
+            if job:
+                job.cancel.set()
+            return {"ok": True}
+        if route == "settings":
+            saved = save_settings(body)
+            STATE.habits_cache = {}
+            return {"settings": saved}
+        if route == "setup":
+            STATE.habits_cache = {}
+            return setup_save(body)
+        if route == "api":
+            return api_save(body)
+        if route == "api/test":
+            return api_test()
+        if route == "open":
+            target = str(body.get("url") or "")
+            if target.startswith(("https://osu.ppy.sh/", "https://opentabletdriver.net/")):
+                webbrowser.open(target)
+            elif target == "songs" and STATE.osu_dir:
+                os.startfile(songs_dir(STATE.osu_dir))
+            return {"ok": True}
+        if route == "log":      # errors of the page, for the log file
+            print(f"[page] {str(body.get('message'))[:2000]}", file=sys.stderr, flush=True)
+            return {"ok": True}
+        if route == "pick-folder":
+            return {"path": pick_folder()}
+        if route == "check-osu":
+            return check_osu_dir(str(body.get("path") or ""))
+        raise UserError(f"unknown: {route}")
+
+
+def import_replay(name: str, data: bytes) -> dict:
+    name = re.sub(r'[<>:"/\\|?*]', "_", Path(name).name) or "replay.osr"
+    if not name.lower().endswith(".osr"):
+        raise UserError("An .osr file is needed")
+    IMPORTED_DIR.mkdir(parents=True, exist_ok=True)
+    path = IMPORTED_DIR / name
+    path.write_bytes(data)
+    h = read_header(path)
+    if h is None or h["mode"] != 0:
+        path.unlink(missing_ok=True)
+        raise UserError("Not a valid osu!standard replay.")
+    return {"id": f"i:{name}"}
+
+
+def check_osu_dir(path: str) -> dict:
+    """Whether a folder is an osu! (stable) install: its beatmap database, replays and Songs."""
+    osu_dir = Path(path) if path else default_osu_dir()
+    if not osu_dir or not osu_dir.is_dir():
+        return {"ok": False, "path": str(osu_dir or ""), "message": "Folder not found."}
+    if not (osu_dir / "osu!.db").exists():
+        return {"ok": False, "path": str(osu_dir),
+                "message": "No osu!.db here: pick the folder that has osu!.exe (osu! stable, not lazer)."}
+    replays = replays_dir(osu_dir)
+    songs = songs_dir(osu_dir)
+    return {"ok": True, "path": str(osu_dir),
+            "replays": sum(1 for _ in replays.glob("*.osr")) if replays.exists() else 0,
+            "songs": sum(1 for p in songs.iterdir() if p.is_dir()) if songs.exists() else 0,
+            "message": ""}
+
+
+def detect() -> dict:
+    """What the setup wizard can find by itself: the osu! folder, OpenTabletDriver's area, the API credentials."""
+    from .setup import OTD_SETTINGS, _from_otd
+    otd = _from_otd()
+    return {
+        "osu": check_osu_dir(load_settings()["osu_dir"]),
+        "otd": {"found": otd is not None, "settings": str(OTD_SETTINGS),
+                "area": [otd.area_w, otd.area_h] if otd else None, "tablet": otd.source if otd else None},
+        "api": api_status(),
+        "setup": setup_get(),
+    }
+
+
+def pick_folder() -> str:
+    """A native folder picker (tkinter), run in its own process so it never fights the server's threads."""
+    code = ("import tkinter as tk; from tkinter import filedialog; r = tk.Tk(); r.withdraw(); "
+            "r.attributes('-topmost', True); print(filedialog.askdirectory(title='osu! folder') or '')")
+    exe = Path(sys.executable)
+    python = exe.with_name("python.exe") if exe.name.lower() == "pythonw.exe" else exe
+    out = subprocess.run([str(python), "-c", code], capture_output=True, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return out.stdout.strip()
+
+
+# --- the window ---------------------------------------------------------------------------------------------------
+
+def _app_browser() -> str | None:
+    roots = [os.environ.get(k) for k in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA")]
+    for root in filter(None, roots):
+        for rel in (r"Microsoft\Edge\Application\msedge.exe", r"Google\Chrome\Application\chrome.exe"):
+            p = Path(root) / rel
+            if p.exists():
+                return str(p)
+    return shutil.which("msedge") or shutil.which("chrome")
+
+
+def main():
+    if sys.stdout is None:              # pythonw: no console
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        sys.stderr = open(CACHE_DIR / "ui_errors.log", "a", encoding="utf-8")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    browser = _app_browser()
+    if browser:
+        subprocess.Popen([browser, f"--app={url}", f"--user-data-dir={BROWSER_PROFILE}", "--window-size=1440,920",
+                          "--no-first-run", "--no-default-browser-check"])
+    else:
+        webbrowser.open(url)
+    print(f"osu-coach: {url}  (stops by itself when the window is closed)")
+    LAST_PING[0] = time.time() + 60     # time to open the window
+    try:
+        while time.time() - LAST_PING[0] < IDLE_EXIT_S:
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
+    server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

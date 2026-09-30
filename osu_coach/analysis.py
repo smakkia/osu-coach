@@ -1,0 +1,59 @@
+"""Aggregate statistics over judged objects."""
+
+import math
+from collections import Counter
+from dataclasses import dataclass
+
+import numpy as np
+
+from .beatmap import SLIDER, SPINNER
+from .judge import ObjectResult
+
+
+@dataclass
+class Summary:
+    counts: Counter            # 300/100/50/0 over all played objects
+    unstable_rate: float       # in real time (DT/HT corrected)
+    mean_error: float          # ms, negative = early
+    mean_early: float
+    mean_late: float
+    aim_mean_distance: float   # mean cursor distance from centre, in radii
+    miss_reasons: Counter
+    slider_breaks: int
+    spinners: int
+
+
+def summarize(results: list[ObjectResult], radius: float, rate: float = 1.0) -> Summary:
+    counts = Counter()
+    miss_reasons = Counter()
+    spinners = 0
+    slider_breaks = 0
+    for r in results:
+        if not r.played:
+            continue
+        counts[r.result] += 1
+        if r.obj.kind == SPINNER:
+            spinners += 1
+            continue
+        if r.miss_reason and (r.result == 0 or r.head_result == 0):
+            miss_reasons[r.miss_reason] += 1
+        # Dropping the end only costs accuracy; a tick or repeat breaks combo.
+        if r.obj.kind == SLIDER and r.slider_break_kind in ("tick", "repeat"):
+            slider_breaks += 1
+
+    errors = np.array([r.hit_error for r in results
+                       if r.played and r.hit_error is not None and (r.head_result or r.result)], dtype=float)
+    offsets = [r.aim_offset for r in results if r.played and r.aim_offset is not None]
+    dist = np.array([math.hypot(*o) / radius for o in offsets]) if offsets else np.array([])
+
+    return Summary(
+        counts=counts,
+        unstable_rate=float(errors.std() * 10 / rate) if len(errors) else 0.0,
+        mean_error=float(errors.mean() / rate) if len(errors) else 0.0,
+        mean_early=float(errors[errors < 0].mean() / rate) if (errors < 0).any() else 0.0,
+        mean_late=float(errors[errors >= 0].mean() / rate) if (errors >= 0).any() else 0.0,
+        aim_mean_distance=float(dist.mean()) if len(dist) else 0.0,
+        miss_reasons=miss_reasons,
+        slider_breaks=slider_breaks,
+        spinners=spinners,
+    )

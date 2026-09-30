@@ -1,0 +1,13 @@
+# environment and build output
+.venv/
+__pycache__/
+*.pyc
+dist/
+
+# local working files
+.scratch/
+TODO.md
+UI.txt
+skills.txt
+aim control.txt
+skill schema.txt
