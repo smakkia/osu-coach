@@ -20,8 +20,62 @@ from .locate import CACHE_DIR
 LOWCONF = CACHE_DIR / "training" / "lowconf.json"
 
 MODEL_PATH = CACHE_DIR / "typeguess.pkl"
+# the same models as plain arrays (to_lite): what the app ships, so it runs without scikit-learn
+LITE_PATH = CACHE_DIR / "typeguess_lite.pkl"
 SURE_TYPE, SURE_MAIN, SURE_AIM = 0.7, 0.7, 0.8
 _model = None
+
+
+class LiteForest:
+    """A fitted HistGradientBoostingClassifier as numpy arrays: every tree walked at once, as scikit-learn does
+    (a missing value goes where the split sent the missing values in training, else x <= threshold goes left)."""
+
+    def __init__(self, model):
+        feature, threshold, nan_left, left, right, leaf, value, roots, cls = [], [], [], [], [], [], [], [], []
+        start = 0
+        for iteration in model._predictors:
+            for k, tree in enumerate(iteration):
+                n = tree.nodes
+                if n["is_categorical"].any():
+                    raise ValueError("categorical splits aren't supported")
+                feature.append(n["feature_idx"]); threshold.append(n["num_threshold"])
+                nan_left.append(n["missing_go_to_left"].astype(bool))
+                left.append(n["left"].astype(np.int64) + start); right.append(n["right"].astype(np.int64) + start)
+                leaf.append(n["is_leaf"].astype(bool)); value.append(n["value"])
+                roots.append(start); cls.append(k)
+                start += len(n)
+        self.feature, self.threshold = np.concatenate(feature), np.concatenate(threshold)
+        self.nan_left, self.leaf, self.value = np.concatenate(nan_left), np.concatenate(leaf), np.concatenate(value)
+        self.left, self.right = np.concatenate(left), np.concatenate(right)
+        self.roots, self.cls = np.array(roots), np.array(cls)
+        self.baseline = np.asarray(model._baseline_prediction, dtype=float).ravel()
+        self.classes_ = np.asarray(model.classes_)
+
+    def predict_proba(self, x) -> np.ndarray:
+        row = np.asarray(x, dtype=float)[0]
+        at = self.roots.copy()
+        while True:
+            inner = ~self.leaf[at]
+            if not inner.any():
+                break
+            node = at[inner]
+            v = row[self.feature[node]]
+            go_left = np.where(np.isnan(v), self.nan_left[node], v <= self.threshold[node])
+            at[inner] = np.where(go_left, self.left[node], self.right[node])
+        raw = self.baseline + np.bincount(self.cls, weights=self.value[at], minlength=len(self.baseline))
+        if len(raw) == 1:   # two classes: one tree per iteration, the log-odds of the second
+            p = 1 / (1 + np.exp(-raw[0]))
+            return np.array([[1 - p, p]])
+        e = np.exp(raw - raw.max())
+        return (e / e.sum())[None, :]
+
+
+def to_lite(src=MODEL_PATH, dst=LITE_PATH):
+    """typeguess.pkl (needs scikit-learn) -> typeguess_lite.pkl (numpy only), for the installer and the data zip."""
+    m = pickle.loads(src.read_bytes())
+    lite = dict(m, models={name: LiteForest(model) for name, model in m["models"].items()})
+    dst.write_bytes(pickle.dumps(lite, protocol=pickle.HIGHEST_PROTOCOL))
+    return lite
 
 
 def _norm(text: str) -> str:
@@ -36,10 +90,14 @@ def _song_key(artist: str, title: str) -> str:
 def _load():
     global _model
     if _model is None:
-        try:
-            _model = pickle.loads(MODEL_PATH.read_bytes())
-        except (OSError, pickle.UnpicklingError, EOFError):
-            _model = False
+        _model = False
+        # the full models where they were trained (fresher than a lite copy), else the lite ones
+        for path in (MODEL_PATH, LITE_PATH):
+            try:
+                _model = pickle.loads(path.read_bytes())
+                break
+            except (OSError, pickle.UnpicklingError, EOFError, ImportError, AttributeError):
+                continue
     return _model or None
 
 
