@@ -20,8 +20,8 @@ HR doesn't change the kind of map (only AR, for reading): maps with HR are read 
 The main kind needs 25% of the intense notes and 1.5 times the second one (tech: fast sliders
 over 37% of the notes); otherwise the map is a hybrid of its two largest kinds (jump + slider aim
 is jump, tech + slider aim is tech). Reading is a tag next to the type, like aim control: from 5 stars
-(nomod), effective AR 8.5 or lower, the finger control/burst share x 1.8 x the aim control ratio x an AR factor (1 at
-AR 8, more as it goes down) from 0.7. Speed is a tag too: stream or finger control/burst maps (alone or in a hybrid)
+(nomod), effective AR 8.5 or lower, ((finger control/burst share x 2.4) ^ 0.5 + (jump share x 0.4) ^ 0.7) x the
+aim control ratio x an AR factor (1 at AR 8, more as it goes down) x (stars / 5.5) ^ 2 from 0.84. Speed is a tag too: stream or finger control/burst maps (alone or in a hybrid)
 over 240 BPM as played, the map's main BPM (x1.5 with DT). Precision is a tag too: CS over 6 as played (x1.3 with
 HR). Reading goes with HR too when HR brings AR over 8.5 (the analysis is read without HR, AR with it).
 
@@ -64,9 +64,13 @@ MIN_SHARE = 0.25                     # a main kind needs this share of the inten
 DOMINANT = 1.5                       # ...and this many times the second one
 READING_MIN_STARS = 5.0              # reading only from this nomod star rating (easier maps have low AR anyway)
 READING_LOW_AR = 8.5                 # at this effective AR or lower...
-READING_FINGER_WEIGHT = 1.8          # ...finger control/burst share x this (100% = 1.8, like a strong aim control)...
-READING_MIN = 0.7                    # ...times the aim control ratio times the AR factor from this much make it reading
+READING_FINGER_WEIGHT = 2.4          # ...finger control/burst share x this...
+READING_FINGER_EXP = 0.5             # ...to this power (under 1: few finger notes cost less, aim control counts more)...
+READING_JUMP_WEIGHT = 0.4            # ...plus the jump share x this (jumps count, less than finger control)...
+READING_JUMP_EXP = 0.7               # ...to this power...
+READING_MIN = 0.84                   # ...times the aim control ratio times the AR factor from this much make it reading
 READING_AR = (3.25, 4.0, 1.25, 8.0)  # AR factor (a / (AR / b + c)) ** d: 1 at AR 8, more as the AR goes down
+READING_STARS = (5.5, 2.0)           # star factor (stars / a) ** b: 1 at 5.5 stars, harder maps weigh more
 SPEED_BPM = 240.0                    # speed tag: stream or finger control/burst maps over this BPM as played
 PRECISION_CS = 6.0                   # precision tag: CS over this as played (HR x1.3, EZ /2)
 MIN_STARS = 3.0                      # maps under this star rating (nomod) get no type: too easy for one to matter
@@ -370,15 +374,19 @@ def has_aim_control(a: dict) -> bool:
 
 
 def reading_ar_factor(ar: float) -> float:
-    """How much the (effective) AR weighs on reading: about 0.74 at AR 8.5, 1 at 8, 1.90 at 7, 3.80 at 6."""
+    """How much the (effective) AR weighs on reading: about 0.74 at AR 8.5, 1 at 8, 1.90 at 7, 3.81 at 6."""
     a, b, c, d = READING_AR
     return (a / (ar / b + c)) ** d
 
 
 def reading_score(a: dict) -> float:
-    """Short groups times changing aim times low AR: the finger control/burst share (weighted so it compares with the
-    aim control ratio, which is about 1 on a usual map) times the aim control ratio times the AR factor."""
-    return a["finger"] * READING_FINGER_WEIGHT * aim_ratio(a) * reading_ar_factor(a["ar"])
+    """Short groups and jumps, times changing aim, times low AR, times difficulty: the finger control/burst share and
+    (counting less) the jump share, each weighted and to a power under 1 (so few of them cost less and the aim control
+    weighs more), times the aim control ratio (about 1 on a usual map), the AR factor and the star factor."""
+    notes = ((a["finger"] * READING_FINGER_WEIGHT) ** READING_FINGER_EXP
+             + (a["jump"] * READING_JUMP_WEIGHT) ** READING_JUMP_EXP)
+    center, power = READING_STARS
+    return notes * aim_ratio(a) * reading_ar_factor(a["ar"]) * (map_stars(a) / center) ** power
 
 
 def has_reading(a: dict) -> bool:
