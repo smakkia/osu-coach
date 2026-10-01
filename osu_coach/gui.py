@@ -1057,6 +1057,7 @@ TECH_TAG_MIN = 0.16      # the tech tag from this tech value (maptypes' tech for
 def tech_tag_share(a: dict) -> float:
     """Tech's value as a tag: maptypes' tech formula (fast sliders, slider variety, share of sliders)."""
     return a["tech sliders"]
+AIM_CONTROL_TAG_MIN_STARS = 4.0   # maps easier than this (nomod) aren't tagged aim control
 ALT_TAG_MAX_BPM = 180   # maps whose alt patterns are faster than this (1/4 BPM as played) aren't tagged alt
 
 
@@ -1073,6 +1074,8 @@ def map_skills(a: dict, min_share: float) -> set[str]:
     tags = {sk for sk in rc.SKILLS if (rc.SKILLS[sk][0] in names if rc.SKILLS[sk][0] else rc.has_skill(a, sk))}
     if (a.get("alt bpm") or 0) > ALT_TAG_MAX_BPM:
         tags.discard("alt")
+    if maptypes.map_stars(a) < AIM_CONTROL_TAG_MIN_STARS:
+        tags.discard("aim control")
     return tags
 
 
@@ -1080,12 +1083,16 @@ MAX_CARD_TAGS = 3
 
 
 def card_tags(a: dict, tagged: set[str], keep=()) -> list[str]:
-    """The tags a map card shows: its skillsets by their share of the intense notes (tech: of the notes), then the
-    aim control / reading / speed / precision tags; at most MAX_CARD_TAGS, the searched-for ones always among them."""
+    """The tags a map card shows: precision first when the map has it, then its skillsets by their share of the
+    intense notes (tech: its own value), then the aim control / reading / speed tags; at most MAX_CARD_TAGS, precision
+    and the searched-for ones always among them."""
     from . import recommend as rc
+    if "precision" in tagged:
+        keep = ("precision", *keep)
     order = list(rc.SKILLS)
     share = lambda sk: tech_tag_share(a) if sk == "tech" else a[rc.SKILL_SHARE[sk]]
-    ranked = sorted(tagged, key=lambda sk: (0, -share(sk)) if sk in rc.SKILL_SHARE else (1, order.index(sk)))
+    ranked = sorted(tagged, key=lambda sk: (-1, 0) if sk == "precision" else
+                    (0, -share(sk)) if sk in rc.SKILL_SHARE else (1, order.index(sk)))
     shown = ranked[:MAX_CARD_TAGS]
     for sk in keep:
         if sk in tagged and sk not in shown:

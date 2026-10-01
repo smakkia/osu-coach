@@ -22,7 +22,7 @@ over 37% of the notes); otherwise the map is a hybrid of its two largest kinds (
 is jump, tech + slider aim is tech). Reading is a tag next to the type, like aim control: from 5 stars
 (nomod), effective AR 8.5 or lower, ((finger control/burst share x 2.4) ^ 0.5 + (jump share x 0.4) ^ 0.7) x the
 aim control ratio x an AR factor (1 at AR 8, more as it goes down) x (stars / 5.5) ^ 2 from 0.84. Speed is a tag too: stream or finger control/burst maps (alone or in a hybrid)
-over 240 BPM as played, the map's main BPM (x1.5 with DT). Precision is a tag too: CS over 6 as played (x1.3 with
+over 240 BPM as played, the map's main BPM (x1.5 with DT). Precision is a tag too: CS 6 or more as played (x1.3 with
 HR). Reading goes with HR too when HR brings AR over 8.5 (the analysis is read without HR, AR with it).
 
 Aim control is a separate factor, a property of the map (read without mods: DT, HT and HR don't
@@ -72,7 +72,7 @@ READING_MIN = 0.84                   # ...times the aim control ratio times the 
 READING_AR = (3.25, 4.0, 1.25, 8.0)  # AR factor (a / (AR / b + c)) ** d: 1 at AR 8, more as the AR goes down
 READING_STARS = (5.5, 2.0)           # star factor (stars / a) ** b: 1 at 5.5 stars, harder maps weigh more
 SPEED_BPM = 240.0                    # speed tag: stream or finger control/burst maps over this BPM as played
-PRECISION_CS = 6.0                   # precision tag: CS over this as played (HR x1.3, EZ /2)
+PRECISION_CS = 6.0                   # precision tag: CS from this as played (HR x1.3, EZ /2)
 MIN_STARS = 3.0                      # maps under this star rating (nomod) get no type: too easy for one to matter
 
 FINGER_BPM = 140                     # short bursts (under ALT_MIN_SPACING) from this 1/4 BPM are finger control
@@ -485,8 +485,8 @@ def has_speed(a: dict) -> bool:
 
 
 def is_precision(cs: float | None) -> bool:
-    """Small circles: CS over PRECISION_CS as played."""
-    return bool(cs) and cs > PRECISION_CS
+    """Small circles: CS PRECISION_CS or more as played."""
+    return bool(cs) and cs >= PRECISION_CS - 1e-6
 
 
 def played_cs(cs: float | None, mods: int) -> float:
