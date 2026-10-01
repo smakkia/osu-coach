@@ -66,7 +66,7 @@ READING_MIN_STARS = 5.0              # reading only from this nomod star rating 
 READING_LOW_AR = 8.5                 # at this effective AR or lower...
 READING_FINGER_WEIGHT = 1.8          # ...finger control/burst share x this (100% = 1.8, like a strong aim control)...
 READING_MIN = 0.7                    # ...times the aim control ratio times the AR factor from this much make it reading
-READING_AR = (3.25, 4.0, 1.25, 4.0)  # AR factor (a / (AR / b + c)) ** d: 1 at AR 8, more as the AR goes down
+READING_AR = (3.25, 4.0, 1.25, 8.0)  # AR factor (a / (AR / b + c)) ** d: 1 at AR 8, more as the AR goes down
 SPEED_BPM = 240.0                    # speed tag: stream or finger control/burst maps over this BPM as played
 PRECISION_CS = 6.0                   # precision tag: CS over this as played (HR x1.3, EZ /2)
 MIN_STARS = 3.0                      # maps under this star rating (nomod) get no type: too easy for one to matter
@@ -370,7 +370,7 @@ def has_aim_control(a: dict) -> bool:
 
 
 def reading_ar_factor(ar: float) -> float:
-    """How much the (effective) AR weighs on reading: about 0.86 at AR 8.5, 1 at 8, 1.38 at 7, 1.95 at 6."""
+    """How much the (effective) AR weighs on reading: about 0.74 at AR 8.5, 1 at 8, 1.90 at 7, 3.80 at 6."""
     a, b, c, d = READING_AR
     return (a / (ar / b + c)) ** d
 

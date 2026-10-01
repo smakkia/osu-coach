@@ -40,6 +40,10 @@ Name: "otd"; Description: "Install OpenTabletDriver (osu!coach reads your tablet
 ; an update replaces the libraries: no leftovers of the old version
 Type: filesandordirs; Name: "{app}\_internal"
 
+[UninstallDelete]
+; the in-app updates add and replace files the installer doesn't know about: all of them go
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "..\dist\osu-coach\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; the map type guesser and its guesses for the ranked maps: shared data, replaced by every version
