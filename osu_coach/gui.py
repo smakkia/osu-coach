@@ -52,6 +52,7 @@ DEFAULT_SETTINGS = {
         "max_pages": 100,
         "mirror": "https://catboy.best/d/{set_id}",
         "tag_min_pct": 20.0,  # a skillset is tagged from this share of the map's intense notes (the main one always)
+        "reading_max_ar": 8.5,  # the reading tag only up to this effective AR (maptypes.READING_LOW_AR)
     },
     "viewer": {
         "skin": "",           # a folder of osu!'s Skins ("": the skin osu! itself uses)
@@ -168,6 +169,12 @@ def apply_advice_settings(settings: dict):
     sa.MIN_OFFSET_RADII = float(a["area_offset_radii"])
     sa.GHOSTS_PER_1000 = float(a["rt_ghosts_per_1000"])
     sa.STUCK_SHARE = float(a["rt_stuck_pct"]) / 100
+
+
+def apply_type_settings(settings: dict):
+    """The map type rules the Settings change: up to which AR a map can be reading."""
+    from . import maptypes
+    maptypes.READING_LOW_AR = float(settings["search"]["reading_max_ar"])
 
 
 def osu_dir_of(settings: dict) -> Path:
@@ -346,10 +353,13 @@ def replay_rows(settings: dict) -> dict:
             cache[key] = h
             changed = True
         m = st.infos.get(h["md5"])
+        # an imported replay's map may be in Songs but not yet in osu!.db (downloaded for it)
+        local = st.index.find(h["md5"]) if m is None and (source == "i" or h["md5"] in FETCHED_MAPS) else None
         played = entry.time if entry else s.st_mtime
         rows.append({
             "id": key, "source": source, "time": played, "player": h["player"],
-            "map": m.display_name if m else "(map not in Songs)", "found": m is not None,
+            "map": m.display_name if m else osu_display_name(local) if local else "(map not in Songs)",
+            "found": m is not None or local is not None,
             "supported": not h["mods"] & (128 | 8192),     # Relax / Autopilot can't be analysed
             "stars": (m.stars.get(_star_key(h["mods"])) or m.stars.get(0)) if m else None,
             "mods": mods_string(h["mods"]), "combo": h["combo"], "max_combo": None, "acc": accuracy(h),
@@ -366,6 +376,63 @@ def replay_rows(settings: dict) -> dict:
             REPLAY_STATS_PATH.write_text(json.dumps(cache), encoding="utf-8")
     rows.sort(key=lambda r: -r["time"])
     return {"owner": st.replays.owner, "replays": rows}
+
+
+def osu_display_name(path: Path) -> str:
+    """"Artist - Title [Version]" from a .osu file's [Metadata]."""
+    meta = {}
+    try:
+        for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+            key, sep, value = line.partition(":")
+            if sep and key.strip() in ("Artist", "Title", "Version"):
+                meta[key.strip()] = value.strip()
+            if line.strip() == "[Difficulty]":
+                break
+    except OSError:
+        pass
+    return f"{meta.get('Artist', '?')} - {meta.get('Title', path.stem)} [{meta.get('Version', '?')}]"
+
+
+FETCHED_MAPS: set[str] = set()   # MD5s of the maps downloaded for replays (not in osu!.db until osu! imports them)
+
+
+def fetch_replay_map(job: Job, settings: dict, replay_id: str) -> dict:
+    """The map of a replay that isn't in Songs: looked up on the osu! site by the replay's beatmap MD5, its set
+    downloaded from the mirror and unpacked into Songs (osu! adds it at the next F5 in song select, or next start)."""
+    import zipfile
+    from . import api
+    st = STATE.load(settings)
+    h = read_header(replay_path(replay_id))
+    if h is None:
+        raise UserError("Not a valid replay.")
+    if st.index.find(h["md5"]):
+        return {"ok": True}
+    job.step("Looking the map up on the osu! site")
+    try:
+        bm = api.OsuApi().get("/beatmaps/lookup", {"checksum": h["md5"]}, ttl=0)
+    except api.ApiError as e:
+        if "HTTP 404" in str(e):
+            raise UserError("This replay's map isn't on the osu! site, or it was changed after the play: "
+                            "it can't be downloaded.")
+        raise UserError(f"osu! API: {e}. Set it up in Settings to download maps.")
+    bs = bm.get("beatmapset") or {}
+    set_id = int(bm["beatmapset_id"])
+    res = download_sets(job, settings, [{"set_id": set_id, "artist": bs.get("artist", ""), "title": bs.get("title", "")}])
+    if res["failed"]:
+        raise UserError(f"The map couldn't be downloaded: {res['failed'][0]['error']}")
+    job.step("Unpacking the map into Songs")
+    for osz in songs_dir(st.osu_dir).glob(f"{set_id} *.osz"):
+        folder = osz.with_suffix("")
+        with zipfile.ZipFile(osz) as z:
+            for member in z.infolist():
+                if folder.resolve() in (folder / member.filename).resolve().parents:   # nothing outside the folder
+                    z.extract(member, folder)
+        osz.unlink()
+    st.index._by_md5 = None     # look at Songs again
+    FETCHED_MAPS.add(h["md5"])
+    if not st.index.find(h["md5"]):
+        raise UserError("The map on the osu! site is a newer version than the replay's: the replay can't be analysed.")
+    return {"ok": True}
 
 
 def replay_path(replay_id: str) -> Path:
@@ -674,6 +741,7 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
                   "aim_distance": s.aim_mean_distance, "slider_breaks": s.slider_breaks,
                   **combo_breaks(results)},
         "habit_plays": used,
+        "offset": offset_advice(s, results, rate, info),
         "priorities": [{
             "category": p.category, "name": p.name, "map_score": p.map_score, "habits_score": p.habits_score,
             "content": p.content, "play_rate": p.play_rate, "usual_rate": p.usual_rate, "rate_label": p.rate_label,
@@ -743,6 +811,36 @@ def refresh_setup_advice(habits: dict):
     habits["habits"] = sorted(kept + [insight_json(i) for i in found if i.kind != "info"], key=lambda i: -i["impact"])
 
 
+OFFSET_MIN_HITS = 50       # hits a play needs for its mean hit error to say something about the offset
+OFFSET_OK_MS = 3           # a mean hit error within this is in time: no offset to change
+
+
+def usual_timing(samples) -> dict | None:
+    """How early or late the player usually is: the median of the mean hit error (real ms) of each recent play."""
+    import numpy as np
+    by_play: dict[int, list[float]] = {}
+    for s in samples:
+        r = s.r
+        if r.hit_error is not None and (r.head_result or r.result):
+            by_play.setdefault(s.play, []).append(r.hit_error / s.rate)
+    means = [float(np.mean(e)) for e in by_play.values() if len(e) >= OFFSET_MIN_HITS]
+    if len(means) < 5:
+        return None
+    return {"plays": len(means), "median": float(np.median(means)),
+            "same_side": float(max(np.mean(np.array(means) > 0), np.mean(np.array(means) < 0)))}
+
+
+def offset_advice(s, results, rate: float, info) -> dict:
+    """The local offset this play suggests for its map: osu!'s local offset moves the hit objects later when it goes
+    up, so hitting late on average asks for it to go up by that much. When the player is off by about as much on
+    every map, it's the universal offset that is wrong."""
+    hits = sum(1 for r in results if r.played and r.hit_error is not None and (r.head_result or r.result))
+    usual = load_profile().get("habits") or {}
+    usual = usual.get("timing")
+    return {"hits": hits, "mean": s.mean_error, "rate": rate, "min_hits": OFFSET_MIN_HITS, "ok_ms": OFFSET_OK_MS,
+            "current": info.local_offset if info else None, "usual": usual}
+
+
 def build_player_profile(job: Job, settings: dict) -> dict:
     from .advice import build_insights, is_high_ar, is_low_ar
     from .setup import load_setup
@@ -783,6 +881,7 @@ def build_player_profile(job: Job, settings: dict) -> dict:
         "habits": [insight_json(i) for i in habits], "notes": [insight_json(i) for i in notes],
         "setup": split_setup(setup_found),
         "trends": skill_trends(samples), "extra_plays": [low_used, high_used],
+        "timing": usual_timing(habit_samples),
     })
     PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     PROFILE_PATH.write_text(json.dumps(data), encoding="utf-8")
@@ -855,6 +954,26 @@ def map_skills(a: dict, min_share: float) -> set[str]:
     return {sk for sk in rc.SKILLS if (rc.SKILLS[sk][0] in names if rc.SKILLS[sk][0] else rc.has_skill(a, sk))}
 
 
+MAX_CARD_TAGS = 3
+
+
+def card_tags(a: dict, tagged: set[str], keep=()) -> list[str]:
+    """The tags a map card shows: its skillsets by their share of the intense notes (tech: of the notes), then the
+    aim control / reading / speed / precision tags; at most MAX_CARD_TAGS, the searched-for ones always among them."""
+    from . import recommend as rc
+    order = list(rc.SKILLS)
+    ranked = sorted(tagged, key=lambda sk: (0, -a[rc.SKILL_SHARE[sk]]) if sk in rc.SKILL_SHARE else (1, order.index(sk)))
+    shown = ranked[:MAX_CARD_TAGS]
+    for sk in keep:
+        if sk in tagged and sk not in shown:
+            drop = next((x for x in reversed(shown) if x not in keep), None)
+            if drop is None:
+                break
+            shown.remove(drop)
+            shown.append(sk)
+    return sorted(shown, key=ranked.index)
+
+
 def search_maps(job: Job, settings: dict, q: dict) -> dict:
     """Maps having every included type and none of the excluded ones, in the ranges (cmd_search, with
     exclusions): from Songs or from the osu! site (downloaded and read), with their real type."""
@@ -925,7 +1044,7 @@ def search_maps(job: Job, settings: dict, q: dict) -> dict:
             tagged = map_skills(a, tag_min) if a else set()
             if a and wanted(a, tagged):
                 share = rc.skill_share(a, include[0]) if include else 0.0
-                tags = [sk for sk in rc.SKILLS if sk in tagged]
+                tags = card_tags(a, tagged, include)
                 found.append(dict(row(share, m, mods, maptypes.label(a), tags, True),
                                   relevance=name_relevance(m, words)))
     if "online" in sources and site_statuses:
@@ -990,7 +1109,7 @@ def search_maps(job: Job, settings: dict, q: dict) -> dict:
                     if not a or not wanted(a, tagged):
                         continue
                     share = rc.skill_share(a, include[0]) if include else 0.0
-                    tags = [sk for sk in rc.SKILLS if sk in tagged]
+                    tags = card_tags(a, tagged, include)
                     r = row(share, m, mods, maptypes.label(a), tags, False)
                     r["rank"] = site_rank[(m.beatmap_id, mods)]
                     r["relevance"] = name_relevance(m, words)
@@ -1158,7 +1277,7 @@ def recommend_maps(job: Job, settings: dict, q: dict) -> dict:
         for n, k in enumerate(rc.ladder(sk, short[sk], kinds, content, profs, model, size=sizes[sk])):
             a = kinds.get(f"{k.info.md5}:{k.mods}")
             local = k.info.md5 in infos
-            r = map_row(k.score, k.info, k.mods, maptypes.label(a) if a else "", sorted(map_skills(a, tag_min)) if a else [],
+            r = map_row(k.score, k.info, k.mods, maptypes.label(a) if a else "", card_tags(a, map_skills(a, tag_min), [sk]) if a else [],
                         local)
             # why this map: the second part of the recommender's own line
             r["why"] = rc.describe_pick(k, sk).split("\n")[0].split("  ")[-1]
@@ -1450,8 +1569,11 @@ class Handler(BaseHTTPRequestHandler):
     def api_get(self, route: str, q: dict):
         LAST_PING[0] = time.time()
         settings = load_settings()
+        apply_type_settings(settings)
         if route == "ping":
             return {"ok": True}
+        if route == "update":
+            return check_update()
         if route == "state":
             from .recommend import SKILLS
             osu = settings["osu_dir"] or str(default_osu_dir() or "")
@@ -1480,6 +1602,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_post(self, route: str, body: dict):
         settings = load_settings()
+        apply_type_settings(settings)
         if route == "analyze":
             return start_job("analyze", lambda job: analyze(job, settings, body["id"])).public()
         if route == "profile":
@@ -1489,6 +1612,10 @@ class Handler(BaseHTTPRequestHandler):
         if route == "search":
             work = recommend_maps if body.get("recommended") else search_maps
             return start_job("search", lambda job: work(job, settings, body)).public()
+        if route == "update/install":
+            return start_job("update", install_update).public()
+        if route == "fetch-map":
+            return start_job("fetch-map", lambda job: fetch_replay_map(job, settings, body["id"])).public()
         if route == "combo-breaks":
             return start_job("combo-breaks", lambda job: count_combo_breaks(job, settings, body["ids"])).public()
         if route == "download":
@@ -1511,7 +1638,7 @@ class Handler(BaseHTTPRequestHandler):
             return api_test()
         if route == "open":
             target = str(body.get("url") or "")
-            if target.startswith(("https://osu.ppy.sh/", "https://opentabletdriver.net/")):
+            if target.startswith(("https://osu.ppy.sh/", "https://opentabletdriver.net/", RELEASES_URL)):
                 webbrowser.open(target)
             elif target == "songs" and STATE.osu_dir:
                 os.startfile(songs_dir(STATE.osu_dir))
@@ -1604,7 +1731,107 @@ def pick_folder() -> str:
 
 # --- the window ---------------------------------------------------------------------------------------------------
 
+# --- updates ------------------------------------------------------------------------------------------------------
+
+GITHUB_REPO = "smakkia/osu-coach"
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+INSTALLER_NAME = re.compile(r"osu-coach-Setup-[\d.]+-windows_x64\.exe$")
+UPDATE_INFO: dict = {}        # the latest release, asked for once per start
+
+
+def version_key(text: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", text))
+
+
+def check_update() -> dict:
+    """Whether a newer release is on GitHub. The installed app (osu-coach.exe) can install it by itself; a copy run
+    with Python gets the release page."""
+    from . import __version__
+    if not UPDATE_INFO:
+        req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                                     headers={"Accept": "application/vnd.github+json", "User-Agent": "osu-coach"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                rel = json.loads(resp.read())
+        except (OSError, ValueError) as e:
+            return {"current": __version__, "newer": False, "error": str(e)}
+        installer = next((a for a in rel.get("assets", []) if INSTALLER_NAME.search(a.get("name", ""))), None)
+        UPDATE_INFO.update({
+            "latest": str(rel.get("tag_name") or "").lstrip("v"), "url": rel.get("html_url") or RELEASES_URL,
+            "notes": str(rel.get("body") or "")[:3000],
+            "installer": installer and {"url": installer["browser_download_url"], "name": installer["name"],
+                                        "size": installer.get("size", 0)},
+        })
+    latest = UPDATE_INFO["latest"]
+    return {**UPDATE_INFO, "current": __version__,
+            "newer": bool(latest) and version_key(latest) > version_key(__version__),
+            "can_install": bool(getattr(sys, "frozen", False) and UPDATE_INFO["installer"])}
+
+
+def install_update(job: Job) -> dict:
+    """Download the new version's installer and run it silently: it closes this app, installs over it and starts it
+    again (tools/setup.iss). The window closes itself a moment later."""
+    info = check_update()
+    if not info["newer"] or not info.get("can_install"):
+        raise UserError("There is no update to install here.")
+    inst = info["installer"]
+    folder = CACHE_DIR / "updates"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / inst["name"]
+    job.step(f"Downloading osu!coach {info['latest']}", 0, max(1, inst["size"]))
+    req = urllib.request.Request(inst["url"], headers={"User-Agent": "osu-coach"})
+    tmp = path.with_suffix(".part")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
+            done = 0
+            while chunk := resp.read(1 << 16):
+                job.check()
+                f.write(chunk)
+                done += len(chunk)
+                job.step(f"Downloading osu!coach {info['latest']}", done, max(done, inst["size"]))
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    job.step("Starting the installer")
+    subprocess.Popen([str(path), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"])
+    threading.Timer(1.5, close_window).start()
+    return {"ok": True}
+
+
+def close_window():
+    if WINDOW:
+        try:
+            WINDOW[0].destroy()
+        except Exception:
+            os._exit(0)
+    else:
+        os._exit(0)
+
+
 WINDOW: list = []     # the app window (pywebview), once open
+
+
+INSTANCE_MUTEX: list = []    # held for the whole life of the window
+
+
+def single_instance() -> bool:
+    """One window at a time (Windows): two would fight over the web view's storage and neither would open. When
+    osu!coach is already open, its window comes to the front instead and this start gives up (False)."""
+    import ctypes
+    kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(None, False, "Local\\osu-coach-window")
+    if kernel32.GetLastError() != 183:     # ERROR_ALREADY_EXISTS
+        INSTANCE_MUTEX.append(handle)
+        return True
+    for _ in range(20):                    # the other one may still be opening its window
+        hwnd = user32.FindWindowW(None, "osu!coach")
+        if hwnd:
+            user32.ShowWindow(hwnd, 9)     # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            break
+        time.sleep(.5)
+    return False
 
 
 def open_window(url: str) -> bool:
@@ -1626,6 +1853,8 @@ def open_window(url: str) -> bool:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("osucoach.app")
         except (AttributeError, OSError):
             pass
+        if not single_instance():
+            return True
     try:
         WINDOW.append(webview.create_window("osu!coach", url, width=width, height=height, min_size=(1000, 640),
                                             background_color="#120d17", text_select=True))

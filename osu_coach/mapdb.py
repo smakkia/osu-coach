@@ -37,6 +37,7 @@ class MapInfo:
     last_played: int         # .NET ticks
     stars: dict[int, float] = field(default_factory=dict)   # osu!standard star rating by mods (0, 64 = DT, 16 = HR...)
     bpm: float = 0.0         # main BPM: the uninherited timing point covering the most of the map
+    local_offset: int = 0    # the player's local offset for the map, ms (+: hit objects later)
 
     @property
     def display_name(self) -> str:
@@ -116,7 +117,7 @@ def read_osu_db(path: Path) -> list[MapInfo]:
         beatmap_id, set_id = r.int(), r.int()
         r.int()     # thread id
         r.skip(4)   # grades
-        r.short()   # local offset
+        local_offset = r.short()
         r.float()   # stack leniency
         mode = r.byte()
         r.string()  # source
@@ -136,5 +137,6 @@ def read_osu_db(path: Path) -> list[MapInfo]:
         if md5:
             maps.append(MapInfo(md5, artist, title, creator, diff_name, f"{folder}/{osu_file}", status,
                                 circles, sliders, spinners, float(ar), float(cs), float(od), drain, total,
-                                beatmap_id, set_id, mode, unplayed, last_played, stars, main_bpm(points, total)))
+                                beatmap_id, set_id, mode, unplayed, last_played, stars, main_bpm(points, total),
+                                local_offset))
     return maps

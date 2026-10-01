@@ -106,17 +106,19 @@ def available() -> bool:
 
 
 def is_reading(p: dict, ar: float, cs: float, od: float, mods_name: str, stars: float | None = None) -> bool:
-    """The reading rule of maptypes (effective AR 8.5 or lower, finger control/burst and aim control) on a guess: the
-    AR is known exactly; finger control/burst must be in the guessed type (or the main kind) and aim control guessed
-    yes (the same x0.95 as the rule). Approximate: the guess gives the type, not the share of finger notes."""
+    """The reading rule of maptypes (effective AR 8.5 or lower, finger control/burst share x aim control x AR) on a guess:
+    the AR is known exactly, the share of finger notes isn't, only the type. Finger control/burst as the main kind
+    (usually 35%+ of the intense notes) reaches the rule with an aim control a bit under the usual: anything but a
+    sure "no"; as the second kind of a hybrid (a smaller share) it needs aim control guessed yes."""
     from .advice import effective_ar
     from .difficulty import Difficulty
     from .maptypes import NAMES, READING_LOW_AR, READING_MIN_STARS
     from .mods import Mods, clock_rate
-    if ar is None or not p or p.get("aim control") is not True or not stars or stars < READING_MIN_STARS:
+    if ar is None or not p or not stars or stars < READING_MIN_STARS:
         return False
-    kind = p.get("kind") or ""
-    if NAMES["finger"].lower() not in [part.strip().lower() for part in kind.split("+")]:
+    parts = [part.strip().lower() for part in (p.get("kind") or "").split("+")]
+    finger, aim = NAMES["finger"].lower(), p.get("aim control")
+    if finger not in parts or not (aim is not False if parts[0] == finger else aim is True):
         return False
     mods = int(Mods.DoubleTime) if mods_name == "DT" else 0
     rate = clock_rate(mods)

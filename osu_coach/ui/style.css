@@ -75,6 +75,10 @@ a:hover { text-decoration: underline; }
 .nav-item.active { background: var(--pink-soft); color: var(--pink-2); box-shadow: inset 3px 0 0 var(--pink); }
 .nav-item:disabled { opacity: .35; cursor: not-allowed; background: transparent; color: var(--text-2); }
 .nav-spacer { flex: 1; }
+.update-card { margin: 0 2px 10px; padding: 12px 14px; border-radius: 12px; background: var(--pink-soft); border: 1px solid var(--pink-line); display: grid; gap: 8px; }
+.update-card b { color: var(--pink-2); }
+.update-card .small { color: var(--text-2); }
+.update-card .progress { margin: 0; }
 
 /* --- page --- */
 main { overflow: auto; min-width: 0; }

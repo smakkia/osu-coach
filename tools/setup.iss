@@ -52,6 +52,8 @@ Name: "{autodesktop}\osu!coach"; Filename: "{app}\osu-coach.exe"; Comment: "Prof
 [Run]
 Filename: "{code:Winget}"; Parameters: "install --id OpenTabletDriver.OpenTabletDriver -e --accept-package-agreements --accept-source-agreements"; StatusMsg: "Installing OpenTabletDriver..."; Tasks: otd; Flags: waituntilterminated
 Filename: "{app}\osu-coach.exe"; Description: "Start osu!coach"; Flags: nowait postinstall skipifsilent
+; the in-app update installs silently: start the new version again
+Filename: "{app}\osu-coach.exe"; Flags: nowait skipifnotsilent
 
 [Code]
 function Winget(Param: String): String;

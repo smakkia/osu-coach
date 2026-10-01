@@ -20,8 +20,8 @@ HR doesn't change the kind of map (only AR, for reading): maps with HR are read 
 The main kind needs 25% of the intense notes and 1.5 times the second one (tech: fast sliders
 over 37% of the notes); otherwise the map is a hybrid of its two largest kinds (jump + slider aim
 is jump, tech + slider aim is tech). Reading is a tag next to the type, like aim control: from 5 stars
-(nomod), effective AR 8.5 or lower, finger control/burst on 25%+ of the intense notes and aim control (at least
-0.95 times the usual for its stars). Speed is a tag too: stream or finger control/burst maps (alone or in a hybrid)
+(nomod), effective AR 8.5 or lower, the finger control/burst share x 1.8 x the aim control ratio x an AR factor (1 at
+AR 9, more as it goes down) from 0.9. Speed is a tag too: stream or finger control/burst maps (alone or in a hybrid)
 over 240 BPM as played, the map's main BPM (x1.5 with DT). Precision is a tag too: CS over 6 as played (x1.3 with
 HR). Reading goes with HR too when HR brings AR over 8.5 (the analysis is read without HR, AR with it).
 
@@ -56,7 +56,7 @@ from .locate import CACHE_DIR
 from .mods import Mods
 
 MAPTYPE_CACHE = CACHE_DIR / "map_types.json"
-MAPTYPE_VERSION = "21"                # bump when the analysis changes
+MAPTYPE_VERSION = "22"                # bump when the analysis changes (22: finger control from 140 BPM)
 
 WINDOW_S = 4.0
 INTENSE = 0.70                       # a window counts at this share of the map's densest / fastest one
@@ -64,14 +64,15 @@ MIN_SHARE = 0.25                     # a main kind needs this share of the inten
 DOMINANT = 1.5                       # ...and this many times the second one
 READING_MIN_STARS = 5.0              # reading only from this nomod star rating (easier maps have low AR anyway)
 READING_LOW_AR = 8.5                 # at this effective AR or lower...
-READING_FINGER = 0.25                # ...finger control/burst on this share of the intense notes...
+READING_FINGER_WEIGHT = 1.8          # ...finger control/burst share x this (100% = 1.8, like a strong aim control)...
+READING_MIN = 0.9                    # ...times the aim control ratio times the AR factor from this much make it reading
+READING_AR = (3.5, 4.0, 1.25, 4.0)   # AR factor (a / (AR / b + c)) ** d: 1 at AR 9, more as the AR goes down
 SPEED_BPM = 240.0                    # speed tag: stream or finger control/burst maps over this BPM as played
 PRECISION_CS = 6.0                   # precision tag: CS over this as played (HR x1.3, EZ /2)
 MIN_STARS = 3.0                      # maps under this star rating (nomod) get no type: too easy for one to matter
-READING_AIM = 0.95                   # ...and aim control (this much of the usual for the star rating) make it reading
 
-FINGER_BPM = 165
-BPM_TOLERANCE = 1.0                  # the 165 BPM limit accepts runs this much slower (164.9 is 165)
+FINGER_BPM = 140                     # short bursts (under ALT_MIN_SPACING) from this 1/4 BPM are finger control
+BPM_TOLERANCE = 1.0                  # the BPM limits accept runs this much slower (139.9 is 140)
 RUN_MAX_SPACING = 4.0                # runs of 4+ spaced wider than this are jumps
 ALT_MIN_SPACING = 2.0                # runs spaced this much or more are alt at any speed
 ALT_MIN_STARS = 4.0                  # below this star rating (nomod)...
@@ -368,11 +369,22 @@ def has_aim_control(a: dict) -> bool:
     return aim_ratio(a) >= AIM_CONTROL_RATIO
 
 
+def reading_ar_factor(ar: float) -> float:
+    """How much the (effective) AR weighs on reading: 1 at AR 9, about 1.16 at 8.5, 1.35 at 8, 1.85 at 7."""
+    a, b, c, d = READING_AR
+    return (a / (ar / b + c)) ** d
+
+
+def reading_score(a: dict) -> float:
+    """Short groups times changing aim times low AR: the finger control/burst share (weighted so it compares with the
+    aim control ratio, which is about 1 on a usual map) times the aim control ratio times the AR factor."""
+    return a["finger"] * READING_FINGER_WEIGHT * aim_ratio(a) * reading_ar_factor(a["ar"])
+
+
 def has_reading(a: dict) -> bool:
     """A tag next to the type, like aim control: low AR on short groups and changing aim, on a map hard enough for
     AR to matter; many notes on screen, hard to read (dense long streams at low spacing are not: they read easily)."""
-    return (map_stars(a) >= READING_MIN_STARS and a["ar"] <= READING_LOW_AR and a["finger"] >= READING_FINGER
-            and aim_ratio(a) >= READING_AIM)
+    return map_stars(a) >= READING_MIN_STARS and a["ar"] <= READING_LOW_AR and reading_score(a) >= READING_MIN
 
 
 SPEED_KINDS = ("stream", "finger")

@@ -159,6 +159,37 @@ async function boot() {
   document.querySelectorAll(".nav-item").forEach(b => b.addEventListener("click", () => show(b.dataset.page)));
   setInterval(() => api("ping").catch(() => {}), 20000);
   show(S.state.first_run ? "setup" : "replays");
+  checkUpdate();
+}
+
+/** A newer release on GitHub: a card in the sidebar. The installed app updates itself (the installer runs silently,
+    closes the window and starts the new version); a copy run with Python opens the release page. */
+async function checkUpdate() {
+  let u;
+  try { u = await api("update"); } catch { return; }
+  if (!u.newer) return;
+  const card = $("#update");
+  const prog = h("div");
+  const btn = h("button.btn.primary.sm", u.can_install ? "Update now" : "Download");
+  btn.addEventListener("click", async () => {
+    if (!u.can_install) return openOsu(u.url);
+    btn.disabled = true;
+    const box = progressBox("Downloading the update…");
+    put(prog, box.el);
+    try {
+      await runJob("update/install", {}, box);
+      put(card, h("div.update-card", h("b", `Installing osu!coach ${u.latest}…`),
+        h("div.small", "The window closes now and the new version starts by itself in a few seconds.")));
+    } catch (e) {
+      toast(e.message, true);
+      put(prog);
+      btn.disabled = false;
+    }
+  });
+  put(card, h("div.update-card", { title: u.notes || "" },
+    h("b", `osu!coach ${u.latest} is out`),
+    h("div.small", `You have ${u.current}.` + (u.can_install ? " Your settings and profile stay as they are." : "")),
+    btn, prog));
 }
 
 const BUILDERS = { profile: buildProfile, skills: buildSkills, improvement: buildImprovement, replays: buildReplays,
@@ -644,7 +675,11 @@ function buildReplays(root) {
     if (last) {
       await load(false);
       const row = R.rows.find(r => r.id === last);
-      if (row) { select(row); analyze(row); }
+      if (row) {
+        select(row);
+        if (row.found) analyze(row);
+        else if (row.supported) fetchMap(row);
+      }
     }
   });
 
@@ -754,7 +789,27 @@ function buildReplays(root) {
             h("div.stat", h("b", { style: { color: "var(--r50)" } }, r.c50), h("span", "50")))),
         h("button.btn.primary.big", { disabled: !r.found || !r.supported, onclick: () => analyze(r) }, icon("play"), "Analyze replay")),
       !r.supported ? h("p.muted", "Relax and Autopilot replays can't be analysed.")
-        : r.found ? null : h("p.muted", "This replay's map is not in your Songs folder: download it to analyse the replay."));
+        : r.found ? null : h("div.row", { style: { marginTop: "12px" } },
+          h("span.muted", "This replay's map is not in your Songs folder."),
+          h("button.btn", { onclick: () => fetchMap(r) }, icon("download"), "Download the map")));
+  }
+
+  /** Download a replay's missing map (looked up on the osu! site), then analyse the replay. */
+  async function fetchMap(r) {
+    if (R.viewer) { R.viewer.destroy(); R.viewer = null; }
+    const box = progressBox("Downloading the map…");
+    put(content, h("div.card", h("h2", "Downloading the replay's map"), box.el));
+    try {
+      await runJob("fetch-map", { id: r.id }, box);
+      toast("Map saved to Songs: press F5 in osu!'s song select to import it.");
+      await load(false);
+      const row = R.rows.find(x => x.id === r.id);
+      if (row) { select(row); if (row.found) analyze(row); }
+    } catch (e) {
+      if (R.selected?.id !== r.id) return;
+      put(content, h("div.card", emptyState("x", "The map couldn't be downloaded", e.message,
+        h("button.btn", { onclick: () => fetchMap(r) }, "Retry"))));
+    }
   }
 
   async function analyze(r) {
@@ -812,6 +867,9 @@ function buildReplays(root) {
     // every mistake, in order
     content.append(mistakesSection(a.viewer, focus));
 
+    // offset
+    if (a.offset) content.append(offsetSection(a.offset));
+
     // setup
     content.append(h("div.section",
       h("div.section-title", h("h2", "Area and rapid trigger"), h("span.count", a.setup_desc)),
@@ -829,6 +887,48 @@ function buildReplays(root) {
           h("button.btn", { onclick: () => trainOn(t) }, icon("search"), "Find maps")))
           : h("p.muted", "Nothing specific to train for this play."),
         a.trends?.length ? h("div", { style: { marginTop: "16px" } }, h("h3", { style: { marginBottom: "8px" } }, "Trend over your recent plays"), trendTable(a.trends)) : null)));
+  }
+
+  /** The local offset this play asks for: osu!'s local offset moves the hit objects later as it goes up, so hitting
+      late on average asks for more. When the player is off by about as much on most maps, the universal one first. */
+  function offsetSection(o) {
+    const ms = x => `${x > 0 ? "+" : x < 0 ? "−" : ""}${Math.abs(Math.round(x))} ms`;
+    const side = x => x > 0 ? "late" : "early";
+    const body = h("div.card");
+    const head = h("div.section-title", h("h2", "Offset"), h("span.count", "from how early or late your hits were on average"));
+    if (o.hits < o.min_hits) {
+      body.append(h("p.muted", { style: { margin: 0 } }, `Too few hits in this play (${o.hits}) to say anything about the offset.`));
+      return h("div.section", head, body);
+    }
+    const u = o.usual;
+    const universal = u && Math.abs(u.median) >= 5 && u.same_side >= .7 && Math.sign(u.median) === Math.sign(o.mean);
+    const diff = universal ? o.mean - u.median : o.mean;       // what's left to this map
+    const change = Math.abs(diff) >= o.ok_ms ? Math.round(diff) : 0;
+    const target = o.current != null ? o.current + change : null;
+    body.append(h("div.stat-row",
+      h("div.stat", h("b", ms(o.mean)), h("span", `on average (${o.hits.toLocaleString("en")} hits)`)),
+      h("div.stat", h("b", o.current != null ? ms(o.current) : "—"), h("span", "local offset now")),
+      h("div.stat", h("b", { style: { color: change ? "var(--pink-2)" : "var(--ok)" } }, change ? (target != null ? ms(target) : `${ms(change)}`) : "keep it"),
+        h("span", change ? (target != null ? "suggested local offset" : "change to the local offset") : "local offset"))));
+    const lines = [];
+    if (universal) {
+      lines.push(h("p", h("b", "Universal offset first. "),
+        `You're ${side(u.median)} by about ${Math.abs(Math.round(u.median))} ms on most maps (median of your last ${u.plays} plays), so it isn't this map: `
+        + `${u.median > 0 ? "raise" : "lower"} the Universal offset in osu!'s options (Audio section) by ${Math.abs(Math.round(u.median))} ms.`
+        + (change ? " Then this map still needs the local offset below." : " Then this map needs nothing of its own.")));
+    }
+    if (change) {
+      lines.push(h("p", `You hit ${Math.abs(Math.round(diff))} ms ${side(diff)}${universal ? " more than usual" : ""} on this map: `
+        + `${change > 0 ? "raise" : "lower"} its local offset${target != null ? ` to ${ms(target)}` : ` by ${Math.abs(change)} ms`} `
+        + "(higher values bring the notes later). In osu!, at the start of the map press + or − to change it by 5 ms, Alt and + or − by 1 ms."));
+    } else if (!universal) {
+      lines.push(h("p", `In time: ${Math.abs(Math.round(o.mean * 10) / 10)} ms ${side(o.mean)} on average is within ${o.ok_ms} ms, no offset to change.`));
+    }
+    if (o.rate !== 1)
+      lines.push(h("p.small.muted", `Measured on a ${o.rate > 1 ? "DT" : "HT"} play: check it on a nomod play too before relying on it.`));
+    lines.push(h("p.small.muted", "It's worth changing only if you're off on this map in more than one play: a single play can be off by a few ms by chance."));
+    body.append(h("div", { style: { marginTop: "12px" } }, lines));
+    return h("div.section", head, body);
   }
 
   function mistakesSection(v, focus) {
@@ -1564,6 +1664,8 @@ function buildSettings(root) {
   const sMirror = h("input.input", { value: sc.mirror });
   const sTag = sensSlider("Tag a skillset from", "A map is tagged (and found by the skillset filters) with every skillset that has at least this share of its intense notes; its main type always. Applied to the next search.",
     sc.tag_min_pct, 0, 60, 1, "%");
+  const sReadAr = sensSlider("Reading up to AR", "A map can be tagged reading only at this effective AR or lower (with the mods it's played with). Lower AR also raises its reading score. Applied to the next search.",
+    sc.reading_max_ar ?? 8.5, 7, 10, 0.1, "");
   wrap.append(h("div.card",
     h("div.card-head", h("div.ico", { html: ICON.search }), h("h3", "Beatmap search")),
     h("div.small.muted", "Starting values of the search page (applied the next time the window opens)."),
@@ -1574,7 +1676,7 @@ function buildSettings(root) {
       h("label.field", "Number of maps shown", sLimit),
       h("label.field", h("span", "Search depth on the site ", h("span.hint", "(pages of 50 sets, one a second)")), sPages)),
     h("label.field", h("span", "Download mirror ", h("span.hint", "({set_id} = the beatmapset's number)")), sMirror),
-    sTag.el));
+    sTag.el, sReadAr.el));
 
   // advice sensitivity
   const a = cfg.advice;
@@ -1646,7 +1748,7 @@ function buildSettings(root) {
       const data = {
         osu_dir: osuDir.value.trim(), habit_plays: +habitPlays.value || 50, skill_plays: +skillPlays.value || 100,
         search: { source: sSource.get(), mods: sMods.get(), status: sStatus.get(), unplayed: sUnplayed.checked,
-          limit: +sLimit.value || 30, max_pages: +sPages.value || 100, mirror: sMirror.value.trim(), tag_min_pct: sTag.get() },
+          limit: +sLimit.value || 30, max_pages: +sPages.value || 100, mirror: sMirror.value.trim(), tag_min_pct: sTag.get(), reading_max_ar: sReadAr.get() },
         advice: Object.fromEntries(Object.entries(sl).map(([k, v]) => [k, v.get()])),
         skills: { stream_ur_tolerance_pct: urTol.get() },
         viewer: { skin: skinSel.value, offset: musicOffset.get() },
