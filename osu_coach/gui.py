@@ -1051,14 +1051,12 @@ def name_relevance(m, words: list[str]) -> float:
     return score
 
 
-TECH_TAG_WEIGHT = 2.0   # tech's share counts this many times as a tag (19% of the notes tags like 38%)...
-TECH_TAG_FROM = 0.15    # ...on maps with more fast sliders than this
+TECH_TAG_MIN = 0.16      # the tech tag from this tech value (maptypes' tech formula), whatever the tag setting
 
 
 def tech_tag_share(a: dict) -> float:
-    """Tech's share as a tag: weighted on maps with more than TECH_TAG_FROM fast sliders."""
-    t = a["tech sliders"]
-    return t * TECH_TAG_WEIGHT if t > TECH_TAG_FROM else t
+    """Tech's value as a tag: maptypes' tech formula (fast sliders, slider variety, share of sliders)."""
+    return a["tech sliders"]
 ALT_TAG_MAX_BPM = 180   # maps whose alt patterns are faster than this (1/4 BPM as played) aren't tagged alt
 
 
@@ -1070,7 +1068,8 @@ def map_skills(a: dict, min_share: float) -> set[str]:
     from . import recommend as rc
     share = {**a, "tech": tech_tag_share(a)}
     names = {part.strip().lower() for part in maptypes.category(a).split("+")}
-    names |= {maptypes.NAMES[k].lower() for k in maptypes.KINDS if share[k] >= min_share}
+    names |= {maptypes.NAMES[k].lower() for k in maptypes.KINDS
+              if share[k] >= (TECH_TAG_MIN if k == "tech" else min_share)}
     tags = {sk for sk in rc.SKILLS if (rc.SKILLS[sk][0] in names if rc.SKILLS[sk][0] else rc.has_skill(a, sk))}
     if (a.get("alt bpm") or 0) > ALT_TAG_MAX_BPM:
         tags.discard("alt")

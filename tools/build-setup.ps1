@@ -44,6 +44,12 @@ try {
     Write-Host "==> The update package" -ForegroundColor Magenta
     & $Python tools\make-update.py $Version
     if ($LASTEXITCODE -ne 0) { throw "could not build the update package" }
+
+    Write-Host "==> Removing the older versions' installers and update packages" -ForegroundColor Magenta
+    $Keep = @("osu-coach-Setup-$Version-windows_x64.exe", "osu-coach-$Version-update.zip")
+    Get-ChildItem $Dist -File | Where-Object {
+        ($_.Name -like "osu-coach-Setup-*-windows_x64.exe" -or $_.Name -like "osu-coach-*-update.zip") -and $Keep -notcontains $_.Name
+    } | ForEach-Object { Write-Host "  $($_.Name)"; Remove-Item -LiteralPath $_.FullName -Force }
 } finally {
     Pop-Location
 }

@@ -1,8 +1,0 @@
-l'app non dovrebbe essere un browser ma un'app python
-blocca le schede finchè non computa il profile (analizza le play)
-quando fai vedere l'errore nella sezione replay, fai partire la sezione a velocità 0.5 
-quando una play ha 0 miss ma non è fc, mostra il numero di sliderbreak
-le mod non vengono selezionate correttamente in beatmap search
-quando scarichi una mappa e mentre scarica premi download all, non annullare quando finisce il primo download
-non usare chrome e fai un'applicazione invece di webapp
-quando fai download all mostra in tempo reale le mappe scaricate e fai un tasto per clearare quelle scaricate
