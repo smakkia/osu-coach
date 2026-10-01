@@ -56,7 +56,7 @@ from .locate import CACHE_DIR
 from .mods import Mods
 
 MAPTYPE_CACHE = CACHE_DIR / "map_types.json"
-MAPTYPE_VERSION = "22"                # bump when the analysis changes (22: finger control from 140 BPM)
+MAPTYPE_VERSION = "23"                # bump when the analysis changes (23: tech sliders over the whole map too)
 
 WINDOW_S = 4.0
 INTENSE = 0.70                       # a window counts at this share of the map's densest / fastest one
@@ -244,6 +244,34 @@ def aim_expected(stars: float) -> float:
     return a * max(stars, 0.0) ** b
 
 
+def _whole_map_tech(ss) -> float:
+    """Share of all the map's notes that are fast sliders (kicksliders in a row weighing less), as `analyse` counts
+    them in the intense windows; scaled the same way when they are slower than the map's jumps."""
+    from .features import FIRST
+    kick_weight, last_kick, total, fast_speeds = 1.0, None, 0.0, []
+    for s in ss:
+        o = s.r.obj
+        if o.kind != "slider" or o.span_duration <= 0:
+            continue
+        length = o.path.length / s.f._radius
+        v = length / (o.span_duration / s.rate / 1000)
+        if v < _fast_threshold(s.rate):
+            continue
+        weight = 1.0
+        if length < KICK_MAX_LENGTH:
+            now = o.time / s.rate
+            kick_weight = kick_weight * KICK_DECAY if last_kick is not None and now - last_kick <= KICK_CHAIN_MS else 1.0
+            weight, last_kick = kick_weight, o.end_time / s.rate
+        total += weight
+        fast_speeds.append(v)
+    if not fast_speeds:
+        return 0.0
+    aim = [s.f.distance_radii / max(s.f.move_ms, 1.0) * 1000 for s in ss
+           if s.f.pattern != FIRST and s.f.distance_radii >= 2]
+    ratio = min(float(np.median(fast_speeds)) / float(np.median(aim)), SLIDER_AIM_RATIO_CAP) if aim else SLIDER_AIM_RATIO_CAP
+    return total / len(ss) * ratio
+
+
 def analyse(samples, ar: float, aim_samples=None, stars: float = 0.0) -> dict | None:
     """Shares of each kind among the intense notes, aim control and a few details. Aim control is read from
     `aim_samples` (the map without mods; the same samples when None) against the nomod star rating."""
@@ -311,7 +339,8 @@ def analyse(samples, ar: float, aim_samples=None, stars: float = 0.0) -> dict | 
     k["tech sliders"] *= ratio
     out = {key: k[key] / n for key in KINDS}
     out.update({
-        "tech sliders": k["tech sliders"] / n,
+        # tech in the hardest parts, or spread over the whole map (fast sliders often fill its calmer parts)
+        "tech sliders": max(k["tech sliders"] / n, _whole_map_tech(ss)),
         "finger changes": k["finger changes"] / k["finger"] if k["finger"] else 0.0,
         "aim control": aim_control(ss if aim_samples is None else aim_samples),
         "aim expected": aim_expected(stars),

@@ -83,7 +83,9 @@ def load_setup() -> Setup:
     except (OSError, ValueError):
         saved = {}
     setup = Setup(**{k: v for k, v in saved.items() if k in Setup.__dataclass_fields__})
-    if setup.device in (None, "tablet") and not setup.area_w:
+    # OpenTabletDriver's area is the one in use: it wins over an area saved here (which may be an old one); the
+    # saved one is for other drivers
+    if setup.device in (None, "tablet"):
         otd = _from_otd()
         if otd:
             for k in ("device", "area_w", "area_h", "area_rotation", "display_w", "display_h"):

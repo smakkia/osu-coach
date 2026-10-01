@@ -3,8 +3,9 @@
 - map score: the category's share of what went wrong in this play (0-100)
 - habits score: the category's share of the impact of the player's bad habits
   (0-100): where their recent plays go clearly worse than their own average.
-  Only habits whose content this map actually has count, so a stream habit is
-  not brought up on a map without streams.
+  Only habits this play shows count: the map has their content (a stream habit
+  is not brought up on a map without streams) and the play has mistakes of
+  their category, on their patterns when the habit is about specific ones.
 """
 
 from dataclasses import dataclass, field
@@ -92,15 +93,28 @@ def _content(category: str, play: list[Sample]) -> tuple[bool, str]:
     return enough, f"{n} {label}"
 
 
+def _mistake(s: Sample, kind: str) -> bool:
+    """A mistake of the kind a bad habit is about: a 100 or 50 for accuracy habits, a miss or a combo break else."""
+    if kind == "accuracy":
+        return s.acc_eligible and s.not_300
+    return s.missed or s.r.slider_break_kind in ("tick", "repeat")
+
+
 def prioritize(episodes: list[Episode], insights: list[Insight],
                play: list[Sample], recent: list[Sample]) -> list[Priority]:
     categories = {e.category for e in episodes} | {i.category for i in insights if i.kind != "info"}
     relevant = {c: _content(c, play) for c in categories}
+    with_mistakes = {e.category for e in episodes}
 
     def applies(i: Insight) -> bool:
-        if not relevant[i.category][0]:
+        """The habit shows in this play: the map has its content, the play has mistakes of its category, and for a
+        habit about specific patterns, some of those mistakes are on them."""
+        if not relevant[i.category][0] or i.category not in with_mistakes:
             return False
-        return i.applies_to is None or sum(map(i.applies_to, play)) >= MIN_SPECIFIC_OBJECTS
+        if i.applies_to is None:
+            return True
+        return (sum(map(i.applies_to, play)) >= MIN_SPECIFIC_OBJECTS
+                and any(i.applies_to(s) and _mistake(s, i.kind) for s in play))
 
     habits = [i for i in insights if i.kind != "info" and i.impact > 0 and applies(i)]
     play_total = sum(e.cost for e in episodes)

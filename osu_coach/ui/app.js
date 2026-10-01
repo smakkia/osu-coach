@@ -292,12 +292,30 @@ function groupHabits(habits) {
   return [...groups.values()].sort((a, b) => b.impact - a.impact);
 }
 
-function adviceCard(title, ico, items, emptyText) {
+function adviceCard(title, ico, items, emptyText, top) {
   return h("div.card",
     h("div.card-head", h("div.ico", { html: ICON[ico] }), h("h3", title)),
+    top || null,
     items.length ? items.map(i => h("div.advice-item",
       h("div.row", h("b", i.title), i.kind === "info" ? h("span.chip.green", "ok") : h("span.chip.pink", "change")),
       h("p", i.detail))) : h("p.muted", { style: { margin: "8px 0 0" } }, emptyText));
+}
+
+/** Overaim or underaim in one play (setup_advice.play_aim): a line over the area advice of the recent plays. */
+function playAimLine(p) {
+  if (!p) return null;
+  let text, color = "var(--text-2)";
+  if (p.scale == null) text = `Too few jumps in this play (${p.jumps}, at least ${p.min_jumps}) to measure overaim or underaim.`;
+  else {
+    const pct = `${p.scale > 0 ? "+" : "−"}${Math.abs(p.scale * 100).toFixed(1)}%`;
+    if (Math.abs(p.scale) < p.ok) text = `In this play: on target (${pct} of the jump distance, ${p.jumps} jumps).`;
+    else {
+      text = `In this play: ${p.scale > 0 ? "overaim" : "underaim"} ${pct} of the jump distance (${p.jumps} jumps).`;
+      color = "var(--warn)";
+    }
+  }
+  return h("div.advice-item", h("p", { style: { margin: 0, color } }, text),
+    h("p.small.muted", { style: { margin: "4px 0 0" } }, "One play varies: the advice below comes from your recent plays."));
 }
 
 function trendTable(trends) {
@@ -386,8 +404,8 @@ function buildProfile(root) {
     body.append(h("div.section",
       h("div.section-title", h("h2", "Area and rapid trigger"), h("span.count", hb.setup_desc)),
       h("div.advice-grid",
-        adviceCard("Area / sensitivity", "tablet", hb.setup?.area || [], "No advice with the current cutoffs."),
-        adviceCard("Keyboard / rapid trigger", "keyboard", hb.setup?.keys || [], "No key problems with the current cutoffs."))));
+        adviceCard("Area / sensitivity", "tablet", hb.setup?.area || [], hb.setup?.area_note || "No advice with the current cutoffs."),
+        adviceCard("Keyboard / rapid trigger", "keyboard", hb.setup?.keys || [], hb.setup?.keys_note || "No key problems with the current cutoffs."))));
     body.append(h("div.section",
       h("div.section-title", h("h2", "Trend"), h("span.count", "miss rate: older half against newer half of your recent plays")),
       h("div.card", trendTable(hb.trends))));
@@ -874,8 +892,9 @@ function buildReplays(root) {
     content.append(h("div.section",
       h("div.section-title", h("h2", "Area and rapid trigger"), h("span.count", a.setup_desc)),
       h("div.advice-grid",
-        adviceCard("Area / sensitivity", "tablet", a.setup.area, "No advice with the current cutoffs."),
-        adviceCard("Keyboard / rapid trigger", "keyboard", a.setup.keys, "No key problems with the current cutoffs."))));
+        adviceCard("Area / sensitivity", "tablet", a.setup.area, a.setup.area_note || "No advice with the current cutoffs.",
+          playAimLine(a.setup.play_aim)),
+        adviceCard("Keyboard / rapid trigger", "keyboard", a.setup.keys, a.setup.keys_note || "No key problems with the current cutoffs."))));
 
     // training
     content.append(h("div.section",
@@ -1351,7 +1370,6 @@ function buildSearch(root) {
           h("span", h("b", "BPM "), num(m.bpm)), h("span", h("b", "AR "), num(m.ar, 1)), h("span", h("b", "CS "), num(m.cs, 1)),
           h("span", h("b", "OD "), num(m.od, 1)), h("span", h("b", "⏱ "), fmtLen(m.length))),
         h("div.tags", m.tags.map(t => h("span.chip.pink", S.state.skill_names[t] || t))),
-        h("div.label", m.label),
         m.why ? h("div.why", m.why) : null));
     card.dataset.set = m.set_id || "";
     card.map = m;
@@ -1627,7 +1645,10 @@ function buildSettings(root) {
   const inp = (v, ph) => h("input.input", { type: "number", step: "any", value: v ?? "", placeholder: ph });
   const areaW = inp(su.area_w, "width mm"), areaH = inp(su.area_h, "height mm"), sens = inp(su.sens, "e.g. 1.0"), dpi = inp(su.dpi, "e.g. 800");
   const rtP = inp(su.rt_press, "mm"), rtR = inp(su.rt_release, "mm"), act = inp(su.actuation, "e.g. 2.0");
-  const tabletRow = h("div.two", h("label.field", "Area: width (mm)", areaW), h("label.field", "Area: height (mm)", areaH));
+  const fromOtd = (su.source || "").startsWith("OpenTabletDriver");
+  if (fromOtd) { areaW.disabled = true; areaH.disabled = true; }
+  const tabletRow = h("div", h("div.two", h("label.field", "Area: width (mm)", areaW), h("label.field", "Area: height (mm)", areaH)),
+    fromOtd ? h("div.small.muted", "Read from OpenTabletDriver: change the area there, osu!coach follows it. After a change the area advice waits for 5 plays with the new area.") : null);
   const mouseRow = h("div.two", h("label.field", "In-game sensitivity", sens), h("label.field", "DPI", dpi));
   const actRow = h("div.two", h("label.field", h("span", "Actuation point (mm) ", h("span.hint", "(how deep a press registers)")), act), h("div"));
   const rtRow = h("div.two", h("label.field", "Rapid trigger: press (mm)", rtP), h("label.field", "Rapid trigger: release (mm)", rtR));
@@ -1641,7 +1662,7 @@ function buildSettings(root) {
   paintSetup();
   wrap.append(h("div.card",
     h("div.card-head", h("div.ico", { html: ICON.tablet }), h("h3", "Your setup")),
-    h("div.small.muted", "Used to give exact numbers in the area and rapid trigger advice. The tablet area is read from OpenTabletDriver unless you enter it."),
+    h("div.small.muted", "Used to give exact numbers in the area and rapid trigger advice. After you change the area or the keyboard settings, their advice starts again and waits for 5 plays made with the new ones."),
     h("div.row", h("span.muted", "Device"), device.el), tabletRow, mouseRow,
     h("div.row", h("span.muted", "Keyboard"), keyboard.el), actRow, rtRow, setupDesc,
     h("div.row", h("button.btn.primary", { onclick: async () => {
