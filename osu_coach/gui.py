@@ -1736,16 +1736,24 @@ def pick_folder() -> str:
 GITHUB_REPO = "smakkia/osu-coach"
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 INSTALLER_NAME = re.compile(r"osu-coach-Setup-[\d.]+-windows_x64\.exe$")
+PACKAGE_NAME = re.compile(r"osu-coach-[\d.]+-update\.zip$")      # tools/make-update.py
+APP_ID = "{1ccc7f17-8fcf-4827-a241-d9103492783a}"                 # tools/setup.iss: its entry in Installed apps
 UPDATE_INFO: dict = {}        # the latest release, asked for once per start
+UPDATES_DIR = CACHE_DIR / "updates"
 
 
 def version_key(text: str) -> tuple[int, ...]:
     return tuple(int(n) for n in re.findall(r"\d+", text))
 
 
+def _asset(rel: dict, pattern) -> dict | None:
+    a = next((a for a in rel.get("assets", []) if pattern.search(a.get("name", ""))), None)
+    return a and {"url": a["browser_download_url"], "name": a["name"], "size": a.get("size", 0)}
+
+
 def check_update() -> dict:
-    """Whether a newer release is on GitHub. The installed app (osu-coach.exe) can install it by itself; a copy run
-    with Python gets the release page."""
+    """Whether a newer release is on GitHub. The installed app (osu-coach.exe) can install it by itself: from its
+    update package (only the changed files), else its installer; a copy run with Python gets the release page."""
     from . import __version__
     if not UPDATE_INFO:
         req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
@@ -1755,31 +1763,20 @@ def check_update() -> dict:
                 rel = json.loads(resp.read())
         except (OSError, ValueError) as e:
             return {"current": __version__, "newer": False, "error": str(e)}
-        installer = next((a for a in rel.get("assets", []) if INSTALLER_NAME.search(a.get("name", ""))), None)
         UPDATE_INFO.update({
             "latest": str(rel.get("tag_name") or "").lstrip("v"), "url": rel.get("html_url") or RELEASES_URL,
             "notes": str(rel.get("body") or "")[:3000],
-            "installer": installer and {"url": installer["browser_download_url"], "name": installer["name"],
-                                        "size": installer.get("size", 0)},
+            "package": _asset(rel, PACKAGE_NAME), "installer": _asset(rel, INSTALLER_NAME),
         })
     latest = UPDATE_INFO["latest"]
     return {**UPDATE_INFO, "current": __version__,
             "newer": bool(latest) and version_key(latest) > version_key(__version__),
-            "can_install": bool(getattr(sys, "frozen", False) and UPDATE_INFO["installer"])}
+            "can_install": bool(getattr(sys, "frozen", False) and (UPDATE_INFO["package"] or UPDATE_INFO["installer"]))}
 
 
-def install_update(job: Job) -> dict:
-    """Download the new version's installer and run it silently: it closes this app, installs over it and starts it
-    again (tools/setup.iss). The window closes itself a moment later."""
-    info = check_update()
-    if not info["newer"] or not info.get("can_install"):
-        raise UserError("There is no update to install here.")
-    inst = info["installer"]
-    folder = CACHE_DIR / "updates"
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / inst["name"]
-    job.step(f"Downloading osu!coach {info['latest']}", 0, max(1, inst["size"]))
-    req = urllib.request.Request(inst["url"], headers={"User-Agent": "osu-coach"})
+def _download(job: Job, asset: dict, path: Path, label: str):
+    job.step(label, 0, max(1, asset["size"]))
+    req = urllib.request.Request(asset["url"], headers={"User-Agent": "osu-coach"})
     tmp = path.with_suffix(".part")
     try:
         with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
@@ -1788,14 +1785,106 @@ def install_update(job: Job) -> dict:
                 job.check()
                 f.write(chunk)
                 done += len(chunk)
-                job.step(f"Downloading osu!coach {info['latest']}", done, max(done, inst["size"]))
+                job.step(label, done, max(done, asset["size"]))
         tmp.replace(path)
     finally:
         tmp.unlink(missing_ok=True)
-    job.step("Starting the installer")
-    subprocess.Popen([str(path), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"])
+
+
+def _sha256(path: Path) -> str | None:
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+# applies an update once the app has closed (its files are locked while it runs): copies the changed files from the
+# unpacked package, deletes the ones the new version doesn't have, records the version in Installed apps and starts it
+APPLY_SCRIPT = r"""param([int]$ProcId, [string]$Plan)
+Start-Transcript -Path ([IO.Path]::ChangeExtension($Plan, '.log')) -Force | Out-Null
+try { Wait-Process -Id $ProcId -Timeout 60 -ErrorAction SilentlyContinue } catch {}
+Start-Sleep -Milliseconds 500
+$p = Get-Content -Raw -Encoding UTF8 -LiteralPath $Plan | ConvertFrom-Json
+foreach ($c in $p.copy) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $c.to) | Out-Null
+    for ($i = 0; $i -lt 10; $i++) {
+        try { Copy-Item -LiteralPath $c.from -Destination $c.to -Force -ErrorAction Stop; break }
+        catch { Start-Sleep -Milliseconds 500 }
+    }
+}
+foreach ($d in $p.delete) { Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue }
+try { Set-ItemProperty -Path $p.uninstall_key -Name DisplayVersion -Value $p.version -ErrorAction Stop } catch {}
+Start-Process -FilePath $p.exe
+Stop-Transcript | Out-Null
+Remove-Item -LiteralPath $p.staging -Recurse -Force -ErrorAction SilentlyContinue
+"""
+
+
+def install_update(job: Job) -> dict:
+    """Install the newer release. From its update package: download, compare every file with the installed one by
+    SHA-256, and once the window has closed write only the files that changed (and delete those the new version
+    no longer has), then start the new version. Without a package: its installer, run silently (tools/setup.iss)."""
+    import shutil
+    import zipfile
+    info = check_update()
+    if not info["newer"] or not info.get("can_install"):
+        raise UserError("There is no update to install here.")
+    UPDATES_DIR.mkdir(parents=True, exist_ok=True)
+    for old in UPDATES_DIR.iterdir():      # what earlier updates left behind
+        shutil.rmtree(old, ignore_errors=True) if old.is_dir() else old.unlink(missing_ok=True)
+    label = f"Downloading osu!coach {info['latest']}"
+    if not info.get("package"):
+        path = UPDATES_DIR / info["installer"]["name"]
+        _download(job, info["installer"], path, label)
+        job.step("Starting the installer")
+        subprocess.Popen([str(path), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"])
+        threading.Timer(1.5, close_window).start()
+        return {"ok": True, "mode": "installer"}
+
+    package = UPDATES_DIR / info["package"]["name"]
+    _download(job, info["package"], package, label)
+    job.step("Comparing the files")
+    staging = UPDATES_DIR / f"staging-{info['latest']}"
+    app_dir = Path(sys.executable).resolve().parent
+    targets = {"app": app_dir, "data": CACHE_DIR}
+    with zipfile.ZipFile(package) as z:
+        manifest = json.loads(z.read("manifest.json"))
+        changed = []
+        for name, digest in manifest["files"].items():
+            prefix, _, rel = name.partition("/")
+            target = (targets[prefix] / rel).resolve()
+            if targets[prefix].resolve() not in target.parents:
+                continue                                   # nothing outside the app and data folders
+            if _sha256(target) != digest:
+                changed.append((name, target))
+        for name, _ in changed:
+            z.extract(name, staging)
+    # files of the old version the new one doesn't have: only inside _internal (the app's own libraries)
+    keep = {(app_dir / n.partition("/")[2]).resolve() for n in manifest["files"] if n.startswith("app/")}
+    internal = app_dir / "_internal"
+    removed = [p for p in internal.rglob("*") if p.is_file() and p.resolve() not in keep] if internal.is_dir() else []
+    plan = {
+        "copy": [{"from": str(staging / name), "to": str(target)} for name, target in changed],
+        "delete": [str(p) for p in removed],
+        "exe": str(Path(sys.executable).resolve()), "staging": str(staging), "version": manifest["version"],
+        "uninstall_key": f"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_ID}_is1",
+    }
+    plan_path = UPDATES_DIR / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    script = UPDATES_DIR / "apply.ps1"
+    script.write_text(APPLY_SCRIPT, encoding="utf-8-sig")
+    package.unlink(missing_ok=True)
+    job.step(f"{len(changed)} files to update, {len(removed)} to remove")
+    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                      "-File", str(script), "-ProcId", str(os.getpid()), "-Plan", str(plan_path)],
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     threading.Timer(1.5, close_window).start()
-    return {"ok": True}
+    return {"ok": True, "mode": "package", "changed": len(changed), "removed": len(removed)}
 
 
 def close_window():

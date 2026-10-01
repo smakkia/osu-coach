@@ -1,4 +1,5 @@
-# Builds dist\osu-coach-Setup-<version>-windows_x64.exe, the installer to attach to a GitHub release:
+# Builds dist\osu-coach-Setup-<version>-windows_x64.exe, the installer to attach to a GitHub release, and
+# dist\osu-coach-<version>-update.zip, the package the installed app updates itself from (only the changed files):
 #   1. the app with PyInstaller (dist\osu-coach: osu-coach.exe and its libraries, without scikit-learn)
 #   2. the map data from this PC's %LOCALAPPDATA%\osu-coach (the type guesser as plain arrays, and its guesses)
 #   3. the installer with Inno Setup 6 (winget install JRSoftware.InnoSetup)
@@ -39,6 +40,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
     $Setup = Join-Path $Dist "osu-coach-Setup-$Version-windows_x64.exe"
     Write-Host ("{0}: {1:N1} MB" -f $Setup, ((Get-Item $Setup).Length / 1MB)) -ForegroundColor Green
+
+    Write-Host "==> The update package" -ForegroundColor Magenta
+    & $Python tools\make-update.py $Version
+    if ($LASTEXITCODE -ne 0) { throw "could not build the update package" }
 } finally {
     Pop-Location
 }
