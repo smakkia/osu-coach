@@ -475,13 +475,14 @@ def gather(job: Job, label: str, last: int, player: str | None = None, select=No
     """Samples of the `last` most recent plays (as __main__._collect_samples), judged in parallel."""
     from .collect import PARALLEL_MIN, _job
     st = STATE
-    jobs = []
+    jobs, times = [], []
     for entry in st.replays.recent(player, select):
         if len(jobs) >= last:
             break
         map_path = st.index.find(entry.md5)
         if map_path is not None:
             jobs.append((str(st.replays.path(entry)), str(map_path)))
+            times.append(entry.time)
     samples, taps, used = [], [], 0
     job.step(label, 0, len(jobs))
     if not jobs:
@@ -496,6 +497,7 @@ def gather(job: Job, label: str, last: int, player: str | None = None, select=No
             play_samples, play_taps = result
             for s in play_samples:
                 s.play = used
+                s.played_at = times[n - 1]     # when it was played: the area advice skips plays before a change
             samples += play_samples
             taps.append(play_taps)
             used += 1
@@ -693,7 +695,12 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
 
     habit_samples, habit_taps, used = habits_for(job, settings, replay.player)
     job.step("Looking for mistakes")
-    setup_found = setup_insights(habit_samples, habit_taps, setup) if habit_samples else []
+    since, keys_since = setup_since()
+    from .setup_advice import measure as setup_measure, play_aim
+    habit_measured = setup_measure(habit_samples, habit_taps) if habit_samples else None
+    setup_found, area_msg = (area_gate(advise_setup(habit_measured, setup, since, keys_since), since, habit_measured)
+                             if habit_measured else ([], ""))
+    setup_found, keys_msg = keys_gate(setup_found, keys_since, habit_measured) if habit_measured else (setup_found, "")
     insights = build_insights(habit_samples) + setup_found if habit_samples else []
     model = ExpectedModel(habit_samples) if habit_samples else None
     normal_ar = [x for x in habit_samples if x.ar <= HIGH_AR]
@@ -749,7 +756,10 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
             "episodes": [{"time": e.time, "stamp": timestamp(e.time), "title": e.title, "reasons": e.reasons,
                           "cost": e.cost} for e in p.episodes],
         } for p in priorities],
-        "setup": split_setup(setup_found),
+        "setup": {**split_setup(setup_found),
+                  "area_note": area_msg,
+                  "keys_note": keys_msg,
+                  "play_aim": play_aim(play_samples)},
         "setup_desc": setup.describe(),
         "training": training,
         "trends": skill_trends(habit_samples),
@@ -793,6 +803,100 @@ def load_profile() -> dict:
     return out
 
 
+AREA_PATH = CACHE_DIR / "ui_area.json"     # the area and keyboard settings last seen, and since when
+
+
+def setup_since() -> tuple[float | None, float | None]:
+    """When the tablet area (size, rotation) or mouse sensitivity, and when the keyboard settings (type, rapid
+    trigger, actuation) last changed, from Settings or from OpenTabletDriver: plays made before a change say nothing
+    about the current settings. None for a part that never changed."""
+    from .setup import load_setup
+    s = load_setup()
+    sigs = {"area": [s.device, s.area_w, s.area_h, s.area_rotation, s.sens, s.dpi],
+            "keys": [s.keyboard, s.rt_press, s.rt_release, s.actuation]}
+    try:
+        seen = json.loads(AREA_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        seen = {}
+    if "sig" in seen:            # the first version kept the area only
+        seen = {"area": seen}
+    changed = False
+    for part, sig in sigs.items():
+        old = seen.get(part)
+        if old is None or old.get("sig") != sig:
+            since = None if old is None else time.time()     # the first time: nothing to compare with
+            if since and part == "area" and s.source.startswith("OpenTabletDriver"):
+                from .setup import OTD_SETTINGS
+                try:    # changed in OpenTabletDriver: when its settings were saved, so the plays since count
+                    since = min(since, OTD_SETTINGS.stat().st_mtime)
+                except OSError:
+                    pass
+            seen[part] = {"sig": sig, "since": since}
+            changed = True
+    if changed:
+        AREA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AREA_PATH.write_text(json.dumps(seen), encoding="utf-8")
+    return seen["area"]["since"], seen["keys"]["since"]
+
+
+def area_since() -> float | None:
+    return setup_since()[0]
+
+
+def advise_setup(measured: dict, setup, since: float | None, keys_since: float | None = None) -> list:
+    from .setup_advice import advise
+    return advise(measured, setup, since, keys_since)
+
+
+AREA_MIN_PLAYS = 5     # plays with a new area before its advice comes back
+KEYS_MIN_PLAYS = 5     # plays with new keyboard settings before the key advice comes back
+
+
+def _key_insight(i) -> bool:
+    return "ghosts" in i.evidence or "stuck" in i.evidence
+
+
+def plays_since(measured: dict, since: float) -> int:
+    """Plays among the measured ones made from `since` on."""
+    from .setup_advice import click_rows
+    if measured.get("taps_by_play"):
+        return sum(1 for p in measured["taps_by_play"] if p.get("time", 0) >= since)
+    times = click_rows(measured["clicks"])[:, 11]
+    return len({t for t in times if t >= since})
+
+
+def keys_gate(found: list, since: float | None, measured: dict) -> tuple[list, str]:
+    """After the keyboard settings changed: no key advice until KEYS_MIN_PLAYS plays were made with them (the advice
+    reads only those), and a note saying so."""
+    if not since:
+        return found, ""
+    n = sum(1 for p in measured.get("taps_by_play", []) if p.get("time", 0) >= since)
+    if n >= KEYS_MIN_PLAYS:
+        return found, ""
+    changed = time.strftime("%d %b %Y", time.localtime(since))
+    return ([i for i in found if not _key_insight(i)],
+            f"Not enough plays with the new keyboard settings ({n} of {KEYS_MIN_PLAYS} since they changed on "
+            f"{changed}): the key advice comes back after {KEYS_MIN_PLAYS - n} more" + ("; recompute the profile then." if n else "."))
+
+
+def area_gate(found: list, since: float | None, measured: dict) -> tuple[list, str]:
+    """After an area change: no area advice until AREA_MIN_PLAYS plays were made with the new area (the advice
+    reads only those), and a note saying so."""
+    if not since:
+        return found, ""
+    n = plays_since(measured, since)
+    if n >= AREA_MIN_PLAYS:
+        if any(not _key_insight(i) for i in found):
+            return found, ""
+        return found, ("Not enough jumps yet in the plays with the new area: the area advice comes back after "
+                       "more of them.")
+    changed = time.strftime("%d %b %Y", time.localtime(since))
+    return ([i for i in found if _key_insight(i)],
+            f"Not enough plays with the new area ({n} of {AREA_MIN_PLAYS} since it changed on {changed}): "
+            f"the area advice comes back after {AREA_MIN_PLAYS - n} more"
+            + ("; recompute the profile then." if n else "."))
+
+
 def refresh_setup_advice(habits: dict):
     """The area and key advice again from what the plays measured, with the current cutoffs and setup: changing
     either in Settings shows at once, without judging the plays again."""
@@ -804,8 +908,10 @@ def refresh_setup_advice(habits: dict):
         return
     apply_advice_settings(load_settings())
     setup = load_setup()
-    found = advise(measured, setup)
-    habits["setup"] = split_setup(found)
+    since, keys_since = setup_since()
+    found, note = area_gate(advise(measured, setup, since, keys_since), since, measured)
+    found, k_note = keys_gate(found, keys_since, measured)
+    habits["setup"] = {**split_setup(found), "area_note": note, "keys_note": k_note}
     habits["setup_desc"] = setup.describe()
     kept = [i for i in habits.get("habits", []) if i.get("category") != "setup"]
     habits["habits"] = sorted(kept + [insight_json(i) for i in found if i.kind != "info"], key=lambda i: -i["impact"])
@@ -868,9 +974,11 @@ def build_player_profile(job: Job, settings: dict) -> dict:
     habit_samples = [s for s in samples if s.play < n_habit]
     setup = load_setup()
     measured = measure(habit_samples, taps[:n_habit])
-    SETUP_STATS_PATH.write_text(json.dumps(clean({"clicks": measured["clicks"].round(2).tolist(), "taps": measured["taps"]})),
-                                encoding="utf-8")
-    setup_found = advise(measured, setup)
+    SETUP_STATS_PATH.write_text(json.dumps(clean({"clicks": measured["clicks"].round(2).tolist(), "taps": measured["taps"],
+                                                  "taps_by_play": measured["taps_by_play"]})), encoding="utf-8")
+    area_changed, keys_changed = setup_since()
+    setup_found, _ = area_gate(advise(measured, setup, area_changed, keys_changed), area_changed, measured)
+    setup_found, _ = keys_gate(setup_found, keys_changed, measured)
     insights = build_insights(habit_samples) + setup_found
     habits = [i for i in insights if i.kind != "info"]
     habits.sort(key=lambda i: -i.impact)
@@ -943,15 +1051,30 @@ def name_relevance(m, words: list[str]) -> float:
     return score
 
 
+TECH_TAG_WEIGHT = 2.0   # tech's share counts this many times as a tag (19% of the notes tags like 38%)...
+TECH_TAG_FROM = 0.15    # ...on maps with more fast sliders than this
+
+
+def tech_tag_share(a: dict) -> float:
+    """Tech's share as a tag: weighted on maps with more than TECH_TAG_FROM fast sliders."""
+    t = a["tech sliders"]
+    return t * TECH_TAG_WEIGHT if t > TECH_TAG_FROM else t
+ALT_TAG_MAX_BPM = 180   # maps whose alt patterns are faster than this (1/4 BPM as played) aren't tagged alt
+
+
 def map_skills(a: dict, min_share: float) -> set[str]:
     """The skillsets a map is tagged with: its main type, every kind with at least `min_share` of the intense notes
-    (tech: of the notes), and the aim control / reading / speed / precision tags."""
+    (tech: of the notes), and the aim control / reading / speed / precision tags. No alt when the map's alt patterns
+    go over ALT_TAG_MAX_BPM: that fast they are spaced bursts and streams, not alt."""
     from . import maptypes
     from . import recommend as rc
-    share = {**a, "tech": a["tech sliders"]}
+    share = {**a, "tech": tech_tag_share(a)}
     names = {part.strip().lower() for part in maptypes.category(a).split("+")}
     names |= {maptypes.NAMES[k].lower() for k in maptypes.KINDS if share[k] >= min_share}
-    return {sk for sk in rc.SKILLS if (rc.SKILLS[sk][0] in names if rc.SKILLS[sk][0] else rc.has_skill(a, sk))}
+    tags = {sk for sk in rc.SKILLS if (rc.SKILLS[sk][0] in names if rc.SKILLS[sk][0] else rc.has_skill(a, sk))}
+    if (a.get("alt bpm") or 0) > ALT_TAG_MAX_BPM:
+        tags.discard("alt")
+    return tags
 
 
 MAX_CARD_TAGS = 3
@@ -962,7 +1085,8 @@ def card_tags(a: dict, tagged: set[str], keep=()) -> list[str]:
     aim control / reading / speed / precision tags; at most MAX_CARD_TAGS, the searched-for ones always among them."""
     from . import recommend as rc
     order = list(rc.SKILLS)
-    ranked = sorted(tagged, key=lambda sk: (0, -a[rc.SKILL_SHARE[sk]]) if sk in rc.SKILL_SHARE else (1, order.index(sk)))
+    share = lambda sk: tech_tag_share(a) if sk == "tech" else a[rc.SKILL_SHARE[sk]]
+    ranked = sorted(tagged, key=lambda sk: (0, -share(sk)) if sk in rc.SKILL_SHARE else (1, order.index(sk)))
     shown = ranked[:MAX_CARD_TAGS]
     for sk in keep:
         if sk in tagged and sk not in shown:
@@ -1631,7 +1755,9 @@ class Handler(BaseHTTPRequestHandler):
             return {"settings": saved}
         if route == "setup":
             STATE.habits_cache = {}
-            return setup_save(body)
+            saved = setup_save(body)
+            setup_since()       # a change counts from now: the plays after it are the ones made with it
+            return saved
         if route == "api":
             return api_save(body)
         if route == "api/test":
