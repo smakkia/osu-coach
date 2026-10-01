@@ -56,7 +56,7 @@ from .locate import CACHE_DIR
 from .mods import Mods
 
 MAPTYPE_CACHE = CACHE_DIR / "map_types.json"
-MAPTYPE_VERSION = "23"                # bump when the analysis changes (23: tech sliders over the whole map too)
+MAPTYPE_VERSION = "26"                # bump when the analysis changes (26: tech from fast sliders, variety, slider share)
 
 WINDOW_S = 4.0
 INTENSE = 0.70                       # a window counts at this share of the map's densest / fastest one
@@ -83,7 +83,21 @@ ALT_MIN_STARS = 4.0                  # below this star rating (nomod)...
 ALT_SLOW_BPM = 125.0                 # ...alt needs notes this fast (1/4 BPM), else jump (or stream for close runs)
 GRID = {1, 2, 4}                     # rhythm changes among these snaps are ordinary
 
-FAST_SLIDER = 25.0                   # radii/s
+FAST_SLIDER = 25.0                   # radii/s of the slider ball: from this a slider is fast (tech)
+# tech is sliders hard to predict: the tech share grows with how much speed and duration change from one slider to the
+# next (mean |log ratio| between consecutive sliders): x (1 + 2 x speed variety) x (1 + duration variety)
+SLIDER_SPEED_VARIETY_WEIGHT = 2.0
+SLIDER_RATIO_SCALE = 2.5             # and with the map's share of sliders: x (2.5 x share) ** 3
+SLIDER_RATIO_POWER = 3.0
+SLIDER_RATIO_MAX = 3.0               # at most x3
+# tech = TECH_SCALE x fast slider share ** TECH_FAST_EXP x variety ** TECH_VARIETY_EXP x slider factor ** TECH_SLIDER_EXP:
+# variety and many sliders weigh more than the fast sliders themselves; the scale keeps the 16% tag and the 37% type
+# about as common as before
+TECH_SCALE = 0.175
+TECH_FAST_EXP = 0.5
+TECH_VARIETY_EXP = 2.0
+TECH_SLIDER_EXP = 1.5
+TECH_MAX_JUMP = 0.50                 # maps with more jumps than this aren't tech
 FAST_SLIDER_DT = 1.3                 # with DT the threshold is this much higher
 TECH_MIN_SHARE = 0.37                # fast sliders over this share of the intense notes: tech
 KICK_MAX_LENGTH = 3.4                # radii: fast sliders shorter than this barely leave the follow circle
@@ -244,6 +258,25 @@ def aim_expected(stars: float) -> float:
     return a * max(stars, 0.0) ** b
 
 
+def slider_variety(ss) -> float:
+    """How unpredictable the map's sliders are: (1 + 2 x speed variety) x (1 + duration variety), where variety is the
+    mean |log ratio| of speed (radii/s) and of duration between consecutive sliders (1 when the map has few sliders)."""
+    speed, duration = [], []
+    for s in ss:
+        o = s.r.obj
+        if o.kind != "slider" or o.span_duration <= 0:
+            continue
+        length = o.path.length / s.f._radius
+        if length > 0:
+            speed.append(length / (o.span_duration / s.rate / 1000))
+            duration.append(max((o.end_time - o.time) / s.rate, 1.0))
+    if len(speed) < 20:
+        return 1.0
+    sv = float(np.mean(np.abs(np.diff(np.log(speed)))))
+    dv = float(np.mean(np.abs(np.diff(np.log(duration)))))
+    return float((1 + SLIDER_SPEED_VARIETY_WEIGHT * sv) * (1 + dv))
+
+
 def _whole_map_tech(ss) -> float:
     """Share of all the map's notes that are fast sliders (kicksliders in a row weighing less), as `analyse` counts
     them in the intense windows; scaled the same way when they are slower than the map's jumps."""
@@ -337,10 +370,23 @@ def analyse(samples, ar: float, aim_samples=None, stars: float = 0.0) -> dict | 
     k["jump"] += k["tech sliders"] * max(0.0, 1 - ratio)
     k["tech"] *= ratio
     k["tech sliders"] *= ratio
+    variety = slider_variety(ss)
+    # the map's share of sliders: (SLIDER_RATIO_SCALE x share) ** SLIDER_RATIO_POWER, 1 at 40% of the objects, at most
+    # SLIDER_RATIO_MAX
+    slider_ratio = min((SLIDER_RATIO_SCALE * sum(1 for s in ss if s.r.obj.kind == "slider") / len(ss)) ** SLIDER_RATIO_POWER,
+                       SLIDER_RATIO_MAX)
     out = {key: k[key] / n for key in KINDS}
+    # fast sliders in the hardest parts, or spread over the whole map (they often fill its calmer parts); then more
+    # with sliders that keep changing speed and length, and with a map made of sliders; none on a jump map
+    fast = max(k["tech sliders"] / n, _whole_map_tech(ss))
+    tech = (TECH_SCALE * fast ** TECH_FAST_EXP * variety ** TECH_VARIETY_EXP * slider_ratio ** TECH_SLIDER_EXP
+            if fast > 0 and out["jump"] <= TECH_MAX_JUMP else 0.0)
+    out["tech"] = tech
     out.update({
-        # tech in the hardest parts, or spread over the whole map (fast sliders often fill its calmer parts)
-        "tech sliders": max(k["tech sliders"] / n, _whole_map_tech(ss)),
+        "tech sliders": tech,
+        "fast sliders": fast,
+        "slider variety": variety,
+        "slider ratio": slider_ratio,
         "finger changes": k["finger changes"] / k["finger"] if k["finger"] else 0.0,
         "aim control": aim_control(ss if aim_samples is None else aim_samples),
         "aim expected": aim_expected(stars),
