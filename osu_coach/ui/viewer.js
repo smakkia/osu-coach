@@ -20,6 +20,8 @@
   const STRIP_CONTROLS = 22;                        // css px on the strip's left kept for its + and - buttons
   const AIM_MS = 8000, AIM_MAX = 40;                // the aim error meter: the last clicks, fading
   const TOP_STRIP = 70;                             // css px kept free above the playfield for the strip
+  // slider bodies as osu! draws a legacy skin's: the border's share of the radius, the body's opacity, gradient steps
+  const SLIDER_BORDER = .128, SLIDER_BODY_ALPHA = .7, SLIDER_STEPS = 10;
 
   function lowerBound(arr, v) {
     let lo = 0, hi = arr.length;
@@ -573,23 +575,56 @@
       ctx.globalAlpha = 1;
     }
 
+    /** A canvas the size of the viewer's, with the playfield's transform, cleared: the slider body is drawn there
+        opaque (so its overlapping strokes don't add up) and then laid on the playfield at once. */
+    layer(ctx, key) {
+      const c = this[key] ||= document.createElement("canvas");
+      if (c.width !== ctx.canvas.width || c.height !== ctx.canvas.height) { c.width = ctx.canvas.width; c.height = ctx.canvas.height; }
+      const g = c.getContext("2d");
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.clearRect(0, 0, c.width, c.height);
+      g.setTransform(ctx.getTransform());
+      g.lineJoin = "round"; g.lineCap = "round";
+      return g;
+    }
+
     drawSlider(ctx, o, now, alpha) {
       const r = this.d.radius, path = o.path;
+      const trace = g => {
+        g.beginPath();
+        g.moveTo(path[0][0], path[0][1]);
+        for (let i = 1; i < path.length; i++) g.lineTo(path[i][0], path[i][1]);
+      };
+      // as osu! draws a legacy skin's slider: an opaque border, and inside it a body 70% opaque, from the track colour
+      // (the skin's, else the combo colour) a little darker at the edge to lighter in the middle
+      const ini = this.skin?.ini || {};
+      const inner = r * 2 * (1 - SLIDER_BORDER);
+      const track = ini.slider_track || toRgb(o.color);
+      const edge = track.map(v => v / 1.1), middle = track.map(v => Math.min(255, v * 1.125 + 255 * .25));
+      const body = this.layer(ctx, "bodyLayer");
+      trace(body);
+      for (let i = 0; i < SLIDER_STEPS; i++) {
+        const k = i / (SLIDER_STEPS - 1);
+        body.strokeStyle = `rgb(${edge.map((v, j) => Math.round(v + (middle[j] - v) * k)).join(",")})`;
+        body.lineWidth = inner * (1 - k * .92);
+        body.stroke();
+      }
+      const border = this.layer(ctx, "borderLayer");
+      trace(border);
+      const bc = ini.slider_border;
+      border.strokeStyle = o.sb != null && now >= o.sb ? "#ff4d6a" : bc ? `rgb(${bc[0]},${bc[1]},${bc[2]})` : "#fff";
+      border.lineWidth = r * 2; border.stroke();
+      border.globalCompositeOperation = "destination-out";
+      border.lineWidth = inner; border.stroke();
+      border.globalCompositeOperation = "source-over";
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = alpha * SLIDER_BODY_ALPHA; ctx.drawImage(body.canvas, 0, 0);
+      ctx.globalAlpha = alpha; ctx.drawImage(border.canvas, 0, 0);
+      ctx.restore();
       ctx.save();
       ctx.globalAlpha = alpha;
       ctx.lineJoin = "round"; ctx.lineCap = "round";
-      ctx.beginPath();
-      ctx.moveTo(path[0][0], path[0][1]);
-      for (let i = 1; i < path.length; i++) ctx.lineTo(path[i][0], path[i][1]);
-      const ini = this.skin?.ini || {}, rgb = c => c && `rgb(${c[0]},${c[1]},${c[2]})`;
-      ctx.strokeStyle = o.sb != null && now >= o.sb ? "#ff4d6a" : rgb(ini.slider_border) || "rgba(255,255,255,.95)";
-      ctx.lineWidth = r * 2; ctx.stroke();
-      if (ini.slider_track) {   // the skin's own track colour
-        ctx.strokeStyle = rgb(ini.slider_track); ctx.lineWidth = r * 1.76; ctx.stroke();
-      } else {
-        ctx.strokeStyle = shade(o.color, -.62); ctx.lineWidth = r * 1.8; ctx.stroke();
-        ctx.strokeStyle = shade(o.color, -.5); ctx.lineWidth = r * 1.1; ctx.stroke();
-      }
       // reverse arrows while repeats remain
       if (o.rep > 1 && now < o.e) {
         const span = (o.e - o.t) / o.rep, done = Math.max(0, Math.floor((now - o.t) / span));
@@ -971,11 +1006,16 @@
     ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
   }
 
-  function shade(hex, k) {
-    const n = parseInt(hex.slice(1), 16);
-    let r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  /** [r, g, b] of a "#rrggbb" or "rgb(r,g,b)" colour. */
+  function toRgb(c) {
+    if (c?.startsWith("#")) { const n = parseInt(c.slice(1), 16); return [n >> 16, (n >> 8) & 255, n & 255]; }
+    const m = String(c).match(/\d+/g);
+    return m && m.length >= 3 ? m.slice(0, 3).map(Number) : [255, 102, 170];
+  }
+
+  function shade(color, k) {
     const f = v => Math.round(k < 0 ? v * (1 + k) : v + (255 - v) * k);
-    return `rgb(${f(r)},${f(g)},${f(b)})`;
+    return `rgb(${toRgb(color).map(f).join(",")})`;
   }
 
   window.ReplayViewer = ReplayViewer;

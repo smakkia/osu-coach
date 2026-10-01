@@ -399,7 +399,9 @@ def predicted_skill(p: dict | None, skill: str) -> bool | None:
         return None
     if skill == "aim control":
         return p.get("aim control")
-    if skill in ("reading", "speed", "precision"):
+    if skill == "reading":   # approximate on a guess (typeguess.is_reading): it can say yes, never a sure no
+        return True if p.get("reading") else None
+    if skill in ("speed", "precision"):
         return bool(p.get(skill))
     if not p.get("kind"):
         return None
