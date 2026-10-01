@@ -21,7 +21,7 @@ The main kind needs 25% of the intense notes and 1.5 times the second one (tech:
 over 37% of the notes); otherwise the map is a hybrid of its two largest kinds (jump + slider aim
 is jump, tech + slider aim is tech). Reading is a tag next to the type, like aim control: from 5 stars
 (nomod), effective AR 8.5 or lower, the finger control/burst share x 1.8 x the aim control ratio x an AR factor (1 at
-AR 9, more as it goes down) from 0.9. Speed is a tag too: stream or finger control/burst maps (alone or in a hybrid)
+AR 8, more as it goes down) from 0.7. Speed is a tag too: stream or finger control/burst maps (alone or in a hybrid)
 over 240 BPM as played, the map's main BPM (x1.5 with DT). Precision is a tag too: CS over 6 as played (x1.3 with
 HR). Reading goes with HR too when HR brings AR over 8.5 (the analysis is read without HR, AR with it).
 
@@ -65,8 +65,8 @@ DOMINANT = 1.5                       # ...and this many times the second one
 READING_MIN_STARS = 5.0              # reading only from this nomod star rating (easier maps have low AR anyway)
 READING_LOW_AR = 8.5                 # at this effective AR or lower...
 READING_FINGER_WEIGHT = 1.8          # ...finger control/burst share x this (100% = 1.8, like a strong aim control)...
-READING_MIN = 0.9                    # ...times the aim control ratio times the AR factor from this much make it reading
-READING_AR = (3.5, 4.0, 1.25, 4.0)   # AR factor (a / (AR / b + c)) ** d: 1 at AR 9, more as the AR goes down
+READING_MIN = 0.7                    # ...times the aim control ratio times the AR factor from this much make it reading
+READING_AR = (3.25, 4.0, 1.25, 4.0)  # AR factor (a / (AR / b + c)) ** d: 1 at AR 8, more as the AR goes down
 SPEED_BPM = 240.0                    # speed tag: stream or finger control/burst maps over this BPM as played
 PRECISION_CS = 6.0                   # precision tag: CS over this as played (HR x1.3, EZ /2)
 MIN_STARS = 3.0                      # maps under this star rating (nomod) get no type: too easy for one to matter
@@ -370,7 +370,7 @@ def has_aim_control(a: dict) -> bool:
 
 
 def reading_ar_factor(ar: float) -> float:
-    """How much the (effective) AR weighs on reading: 1 at AR 9, about 1.16 at 8.5, 1.35 at 8, 1.85 at 7."""
+    """How much the (effective) AR weighs on reading: about 0.86 at AR 8.5, 1 at 8, 1.38 at 7, 1.95 at 6."""
     a, b, c, d = READING_AR
     return (a / (ar / b + c)) ** d
 
