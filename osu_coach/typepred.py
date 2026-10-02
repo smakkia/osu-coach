@@ -76,7 +76,9 @@ def api_index():
 def build():
     osu = default_osu_dir()
     db = [m for m in read_osu_db(osu / "osu!.db") if m.mode == 0]
-    kinds = json.loads((maptypes.MAPTYPE_CACHE).read_text(encoding="utf-8"))["maps"]
+    from .cachedb import Store
+    with Store(maptypes.MAPTYPE_CACHE, maptypes.MAPTYPE_VERSION, legacy=maptypes.MAPTYPE_CACHE.with_suffix(".json")) as db:
+        kinds = dict(db.items())
     meta, scores = api_index()
     # every ranked map's API metadata (ranked_meta.py): popularity, genre and language for the maps learnt from,
     # as the site's search gives them for the maps guessed online; and every ranked map not in Songs to guess

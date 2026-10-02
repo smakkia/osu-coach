@@ -359,6 +359,9 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .map-card .cover .badges { position: absolute; left: 12px; right: 12px; bottom: 10px; display: flex; gap: 6px; z-index: 1; align-items: center; }
 .map-card .cover .badges > * { flex-shrink: 0; }
 .map-card .cover .badges > .grow { flex-shrink: 1; }
+/* the download button / its state: a box of its own, centred like the chips whatever it holds, kept on the right */
+.map-card .cover .badges > .dl-slot { display: flex; align-items: center; margin-left: auto; }
+.map-card .cover .badges > .dl-slot > * { white-space: nowrap; }
 .map-card .body { padding: 12px 14px 14px; display: grid; gap: 8px; }
 .map-card .title { font-weight: 700; line-height: 1.25; }
 .map-card .sub { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

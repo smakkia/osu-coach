@@ -55,7 +55,7 @@ import numpy as np
 from .locate import CACHE_DIR
 from .mods import Mods
 
-MAPTYPE_CACHE = CACHE_DIR / "map_types.json"
+MAPTYPE_CACHE = CACHE_DIR / "map_types.db"
 MAPTYPE_VERSION = "26"                # bump when the analysis changes (26: tech from fast sliders, variety, slider share)
 
 WINDOW_S = 4.0
