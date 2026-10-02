@@ -887,7 +887,7 @@ function buildReplays(root) {
     const vwrap = h("div", { style: { marginTop: "16px" } });
     content.append(vwrap);
     R.viewer = new ReplayViewer(vwrap, a.viewer, { sections, skin: loadSkin(), musicOffset: () => S.state.settings.viewer.offset,
-      cursorSize: () => S.state.settings.viewer.cursor_size });
+      cursorSize: () => S.state.settings.viewer.cursor_size, fullscreen: on => api("fullscreen", { on }) });
     const focus = t => { R.viewer.focus(t - 1500, t + 2500); vwrap.scrollIntoView({ behavior: "smooth", block: "start" }); };
 
     // problems
@@ -1672,21 +1672,21 @@ function buildSettings(root) {
   const tabletRow = h("div", h("div.two", h("label.field", "Area: width (mm)", areaW), h("label.field", "Area: height (mm)", areaH)),
     fromOtd ? h("div.small.muted", "Read from OpenTabletDriver: change the area there, osu!coach follows it. After a change the area advice waits for 5 plays with the new area.") : null);
   const mouseRow = h("div.two", h("label.field", "In-game sensitivity", sens), h("label.field", "DPI", dpi));
-  const actRow = h("div.two", h("label.field", h("span", "Actuation point (mm) ", h("span.hint", "(how deep a press registers)")), act), h("div"));
-  const rtRow = h("div.two", h("label.field", "Rapid trigger: press (mm)", rtP), h("label.field", "Rapid trigger: release (mm)", rtR));
+  const rtFields = [h("label.field", "Rapid trigger: press (mm)", rtP), h("label.field", "Rapid trigger: release (mm)", rtR)];
+  const keyRow = h("div.three", h("label.field", h("span", "Actuation point (mm) ", h("span.hint", "(how deep a press registers)")), act), ...rtFields);
   const setupDesc = h("div.small.muted", su.describe);
   function paintSetup() {
     tabletRow.classList.toggle("hidden", device.get() !== "tablet");
     mouseRow.classList.toggle("hidden", device.get() !== "mouse");
-    rtRow.classList.toggle("hidden", keyboard.get() !== "rt");
-    actRow.classList.toggle("hidden", !keyboard.get());
+    rtFields.forEach(f => f.classList.toggle("hidden", keyboard.get() !== "rt"));
+    keyRow.classList.toggle("hidden", !keyboard.get());
   }
   paintSetup();
   wrap.append(h("div.card",
     h("div.card-head", h("div.ico", { html: ICON.tablet }), h("h3", "Your setup")),
     h("div.small.muted", "Used to give exact numbers in the area and rapid trigger advice. After you change the area or the keyboard settings, their advice starts again and waits for 5 plays made with the new ones."),
     h("div.row", h("span.muted", "Device"), device.el), tabletRow, mouseRow,
-    h("div.row", h("span.muted", "Keyboard"), keyboard.el), actRow, rtRow, setupDesc,
+    h("div.row", h("span.muted", "Keyboard"), keyboard.el), keyRow, setupDesc,
     h("div.row", h("button.btn.primary", { onclick: async () => {
       try {
         const r = await api("setup", { device: device.get(), keyboard: keyboard.get(), area_w: areaW.value, area_h: areaH.value,
@@ -1757,7 +1757,7 @@ function buildSettings(root) {
     vc.cursor_size ?? 1, 0.5, 2, 0.1, "x");
   wrap.append(h("div.card",
     h("div.card-head", h("div.ico", { html: ICON.play }), h("h3", "Replay viewer")),
-    h("label.field", "Skin", skinSel), skinNote, musicOffset.el, cursorSize.el));
+    h("label.field", "Skin", skinSel), skinNote, cursorSize.el, musicOffset.el));
 
   // profile
   const habitPlays = h("input.input.num", { type: "number", min: 10, max: 1000, value: cfg.habit_plays });

@@ -136,6 +136,11 @@ h3 { font: 650 15px/1.35 var(--font); margin: 0; }
 }
 .input:focus { border-color: var(--pink); box-shadow: 0 0 0 3px var(--pink-soft); }
 .input.num { width: 96px; }
+/* drop-downs: our own arrow, away from the edge (the system's sits right against it) */
+select.input {
+  appearance: none; padding-right: 30px; cursor: pointer;
+  background: var(--bg-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23cdbfd6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 8px center / 14px 14px;
+}
 label.field { display: grid; gap: 6px; font-weight: 600; font-size: 13px; color: var(--text-2); }
 label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; color: var(--text-2); }
@@ -288,6 +293,16 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .rp .meta .fc { color: var(--ok); font-weight: 700; }
 .rp .meta .sb { color: var(--warn); font-family: var(--mono); font-weight: 700; }
 .rp.missing { opacity: .55; }
+/* narrower windows: the replay list gets narrower and its text smaller (full size from a 1540px wide window) */
+.replay-layout { grid-template-columns: clamp(260px, 26vw, 400px) 1fr; }
+.replay-side { --s: clamp(.8px, 100vw / 1540, 1px); }
+.replay-side .tools { padding: calc(20 * var(--s)) calc(16 * var(--s)) calc(12 * var(--s)); gap: calc(10 * var(--s)); }
+.replay-side h1 { font-size: calc(20 * var(--s)); }
+.replay-side .btn.sm, .replay-side .input, .replay-side select { font-size: calc(12.5 * var(--s)); }
+.replay-list { padding: calc(6 * var(--s)) calc(8 * var(--s)) 20px; }
+.rp { padding: calc(10 * var(--s)) calc(12 * var(--s)); gap: calc(4 * var(--s)); }
+.rp .name { font-size: calc(13.5 * var(--s)); }
+.rp .meta { font-size: calc(12 * var(--s)); gap: calc(8 * var(--s)); }
 .replay-main { overflow: auto; min-width: 0; }
 .replay-main .page { max-width: 1250px; }
 
@@ -295,6 +310,18 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .play-head .cover { position: absolute; inset: 0; background-size: cover; background-position: center; opacity: .18; filter: blur(2px); mask-image: linear-gradient(90deg, transparent, #000 60%); }
 .play-head > * { position: relative; }
 .play-head h2 { margin: 0 0 6px; font-size: 21px; }
+/* the replay's header scales with its width (designed at 800px: --u is one pixel there), nothing wrapping */
+.play-head { container-type: inline-size; --u: max(.85px, 100cqi / 800); }
+.play-head h2 { font-size: calc(21 * var(--u)); margin-bottom: calc(6 * var(--u)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.play-head > div { min-width: 0; }
+.play-head .row { flex-wrap: nowrap; gap: calc(10 * var(--u)); white-space: nowrap; font-size: calc(14 * var(--u)); }
+.play-head .chip { font-size: calc(12 * var(--u)); padding: calc(3 * var(--u)) calc(10 * var(--u)); }
+.play-head .stat-row { flex-wrap: nowrap; gap: calc(22 * var(--u)); margin-top: calc(14 * var(--u)) !important; white-space: nowrap; }
+.play-head .stat b { font-size: calc(20 * var(--u)); }
+.play-head .stat span { font-size: calc(12 * var(--u)); }
+.play-head .hits { gap: calc(12 * var(--u)); font-size: calc(14 * var(--u)); }
+.play-head .btn { font-size: calc(14 * var(--u)); padding: calc(9 * var(--u)) calc(16 * var(--u)); gap: calc(8 * var(--u)); }
+.play-head .btn svg { width: calc(16 * var(--u)); height: calc(16 * var(--u)); }
 .stat-row { display: flex; gap: 22px; flex-wrap: wrap; }
 .stat b { display: block; font: 700 20px var(--font-display); }
 .stat span { font-size: 12px; color: var(--muted); }
@@ -305,6 +332,12 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .viewer { display: grid; gap: 0; }
 .viewer-stage { position: relative; background: #0b080e; border-radius: var(--radius) var(--radius) 0 0; overflow: hidden; aspect-ratio: 16 / 10; }
 .viewer-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+/* full screen: the stage and its bar fill the window, the bar with the replay's options kept under it */
+.viewer.full { position: fixed; inset: 0; z-index: 10000; margin: 0 !important; grid-template-rows: minmax(0, 1fr) auto; background: #0b080e; }   /* !important: over the page's inline margin-top */
+.viewer.full .viewer-stage { aspect-ratio: auto; border-radius: 0; min-height: 0; }
+.viewer.full .viewer-bar { border-radius: 0; border-width: 1px 0 0; --v: clamp(.9px, 100cqi / 1280, 1.5px); }   /* room for the play */
+body.viewer-full main { overflow: hidden; }
+.full-btn svg { width: 18px; height: 18px; }
 .viewer-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-top: 0; border-radius: 0 0 var(--radius) var(--radius); flex-wrap: wrap; }
 .speed-slider { display: flex; align-items: center; gap: 8px; }
 .speed-track { display: flex; flex-direction: column; width: 150px; }
@@ -317,11 +350,33 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .vol input { width: 80px; accent-color: var(--pink); }
 .vol-val { font-family: var(--mono); min-width: 34px; color: var(--text); }
 .viewer-bar .time { font-family: var(--mono); color: var(--text-2); min-width: 120px; }
-.timeline { position: relative; height: 38px; flex: 1 1 300px; cursor: pointer; border-radius: 8px; background: var(--bg-2); overflow: hidden; }
+.viewer-bar .bar-break { flex-basis: 100%; height: 0; }
+.timeline { position: relative; height: 38px; flex: 1 1 0; min-width: 0; cursor: pointer; border-radius: 8px; background: var(--bg-2); overflow: hidden; }
 .timeline canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .play-btn { width: 40px; height: 40px; border-radius: 50%; padding: 0; }
 .play-btn svg { width: 18px; height: 18px; fill: currentColor; stroke: none; }
 .viewer-opts { display: flex; gap: 12px; align-items: center; }
+/* the viewer's bar scales with the viewer's width (designed at 800px: --v is one pixel there) */
+.viewer { container-type: inline-size; }
+.viewer-bar { --v: clamp(.9px, 100cqi / 800, 2.5px); gap: calc(10 * var(--v)); padding: calc(10 * var(--v)) calc(14 * var(--v)); font-size: calc(14 * var(--v)); }
+.viewer-bar .small { font-size: calc(12.5 * var(--v)); }
+.viewer-bar .check { gap: calc(4 * var(--v)); margin-right: calc(10 * var(--v)); }   /* the text close to its box, apart from the next one */
+.viewer-bar .check input { width: calc(16 * var(--v)); height: calc(16 * var(--v)); margin: 0; }
+.viewer-bar .time { min-width: calc(120 * var(--v)); }
+.viewer-bar .timeline { height: calc(38 * var(--v)); }
+.viewer-bar .play-btn { width: calc(40 * var(--v)); height: calc(40 * var(--v)); }
+.viewer-bar .play-btn svg { width: calc(18 * var(--v)); height: calc(18 * var(--v)); }
+.viewer-bar .full-btn { padding: calc(7 * var(--v)); }
+.viewer-bar .full-btn svg { width: calc(18 * var(--v)); height: calc(18 * var(--v)); }
+.viewer-bar .speed-slider { gap: calc(8 * var(--v)); }
+.viewer-bar .speed-track { width: calc(150 * var(--v)); }
+.viewer-bar .speed-ticks { font-size: calc(10 * var(--v)); padding: 0 calc(7 * var(--v)); }
+.viewer-bar .speed-val { min-width: calc(42 * var(--v)); }
+.viewer-bar .volumes { gap: calc(22 * var(--v)); }
+.viewer-bar .vol { font-size: calc(12 * var(--v)); gap: calc(4 * var(--v)); }
+.viewer-bar .vol input { width: calc(80 * var(--v)); }
+.viewer-bar .vol-val { min-width: calc(34 * var(--v)); }
+.viewer-bar .kbd { font-size: calc(11 * var(--v)); padding: calc(1 * var(--v)) calc(6 * var(--v)); }
 .kbd { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 5px; background: var(--surface-3); color: var(--text-2); border: 1px solid var(--border-strong); }
 
 .problem { padding: 0; overflow: hidden; }
@@ -379,6 +434,8 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .settings .card { scroll-margin-top: 64px; }
 .settings .card { display: grid; gap: 16px; }
 .settings .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+.settings .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: end; }
+@media (max-width: 700px) { .settings .three { grid-template-columns: 1fr; } }
 .sens { display: grid; grid-template-columns: 1fr 90px; gap: 6px 16px; align-items: center; }
 .sens .val { font-family: var(--mono); color: var(--pink-2); text-align: right; }
 .sens .hint { grid-column: 1 / -1; color: var(--muted); font-size: 12px; margin-top: -2px; }
@@ -457,5 +514,6 @@ ul.also b { color: var(--text); font-weight: 600; }
   background: var(--surface-3); border: 1px solid var(--border-strong); font-size: 12px; pointer-events: none; white-space: nowrap; box-shadow: var(--shadow); }
 .elo-tip span:not(.muted) { font-family: var(--mono); color: var(--text); }
 .strip-speed { position: absolute; top: 10px; display: flex; flex-direction: column; gap: 2px; width: 22px; }
+.strip-speed { top: calc(10px * var(--strip, 1)); transform: scale(var(--strip, 1)); transform-origin: top left; }   /* with the strip */
 .strip-speed .btn { width: 22px; height: 16px; padding: 0; border-radius: 4px; justify-content: center; font-family: var(--mono);
   font-size: 12px; line-height: 1; background: rgba(18, 13, 23, .7); }

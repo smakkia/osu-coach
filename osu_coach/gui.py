@@ -618,6 +618,34 @@ def skill_trends(samples: list) -> list[dict]:
 
 # --- analysis of one replay ---------------------------------------------------------------------------------
 
+def combo_timeline(results, diff) -> list[list[int]]:
+    """The combo as the play goes, as stable counts it: [time, combo] at each change. +1 for a circle, a slider's
+    head, ticks, repeats and end and a spinner; a miss, a missed slider head or a dropped tick or repeat breaks it;
+    a dropped slider end only misses its +1."""
+    from .beatmap import CIRCLE, SLIDER
+    events = []   # (time, +1 or 0 for a break)
+    for r in results:
+        o = r.obj
+        if r.result is None:
+            continue
+        if o.kind == CIRCLE:
+            events.append((r.hit_time if r.result else o.time + diff.hit50, 1 if r.result else 0))
+        elif o.kind == SLIDER:
+            if r.head_result is not None:
+                events.append((r.hit_time if r.head_result else o.time + diff.hit50, 1 if r.head_result else 0))
+            for t, kind, hit in r.points:
+                if hit or kind != "end":
+                    events.append((t, 1 if hit else 0))
+        else:
+            events.append((o.end_time, 1 if r.result else 0))
+    events.sort(key=lambda e: e[0])
+    out, combo = [], 0
+    for t, add in events:
+        combo = combo + 1 if add else 0
+        out.append([t, combo])
+    return out
+
+
 def viewer_data(beatmap, results, replay, diff, rate, samples) -> dict:
     """What the page needs to draw the play and list its mistakes: objects (as clicked: stacked, HR-flipped), their
     results and patterns, and the input."""
@@ -649,7 +677,7 @@ def viewer_data(beatmap, results, replay, diff, rate, samples) -> dict:
     f = replay.frames
     return {"objects": objects, "radius": diff.radius, "preempt": diff.preempt,
             "fadein": 400 * min(1, diff.preempt / 450), "rate": rate, "hidden": bool(replay.mods & 8),
-            "windows": [diff.hit300, diff.hit100, diff.hit50],
+            "windows": [diff.hit300, diff.hit100, diff.hit50], "combo": combo_timeline(results, diff),
             "frames": {"t": [p.time for p in f], "x": [round(p.x, 1) for p in f], "y": [round(p.y, 1) for p in f],
                        "k": [p.keys for p in f]}}
 
@@ -1905,6 +1933,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": True}
         if route == "pick-folder":
             return {"path": pick_folder()}
+        if route == "fullscreen":   # the replay viewer's full screen: the app window too, not only the page
+            return {"on": set_fullscreen(bool(body.get("on")))}
         if route == "check-osu":
             return check_osu_dir(str(body.get("path") or ""))
         raise UserError(f"unknown: {route}")
@@ -2155,6 +2185,14 @@ def close_window():
 
 
 WINDOW: list = []     # the app window (pywebview), once open
+FULLSCREEN = [False]  # whether the app window is full screen (pywebview only toggles it)
+
+
+def set_fullscreen(on: bool) -> bool:
+    if WINDOW and FULLSCREEN[0] != on:
+        WINDOW[0].toggle_fullscreen()
+        FULLSCREEN[0] = on
+    return FULLSCREEN[0]
 
 
 INSTANCE_MUTEX: list = []    # held for the whole life of the window
@@ -2212,6 +2250,22 @@ def open_window(url: str) -> bool:
     return True
 
 
+def exit_now():
+    """Leave as soon as the window is closed. A normal exit would first wait for every process pool still at work
+    (an analysis or a search running in the background) to finish its queue, while the single-instance mutex keeps
+    osu!coach from opening again. Everything is saved as it goes (caches, settings), so nothing is lost: the
+    workers are stopped and the process ends."""
+    import multiprocessing
+    for child in multiprocessing.active_children():
+        child.terminate()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(0)
+
+
 def main():
     if sys.stdout is None:              # pythonw: no console
         sys.stdout = open(os.devnull, "w")
@@ -2225,8 +2279,7 @@ def main():
     print(f"osu-coach: {url}  (stops by itself when the window is closed)")
     if not os.environ.get("OSU_COACH_NO_WINDOW"):
         if open_window(url):    # returns when the window is closed
-            server.shutdown()
-            return
+            exit_now()
         webbrowser.open(url)
     LAST_PING[0] = time.time() + 60     # time to open the window
     try:
