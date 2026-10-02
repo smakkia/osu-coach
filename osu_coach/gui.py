@@ -57,6 +57,7 @@ DEFAULT_SETTINGS = {
     "viewer": {
         "skin": "",           # a folder of osu!'s Skins ("": the skin osu! itself uses)
         "offset": 0,          # ms the viewer's music plays earlier (-100..100)
+        "cursor_size": 1.0,   # the viewer's cursor, x this (0.5..2)
     },
     "skills": {
         "stream_ur_tolerance_pct": 10.0,   # stream minimum BPM: UR within this of the UR at the comfort BPM
@@ -226,6 +227,17 @@ class Job:
 JOBS: dict[str, Job] = {}
 
 
+def wait_for(job: Job, fut):
+    """A future's result, waited for in short steps so that Stop ends the job at once (Cancelled)."""
+    from concurrent.futures import TimeoutError as FutureTimeout
+    while True:
+        job.check()
+        try:
+            return fut.result(timeout=0.25)
+        except FutureTimeout:
+            pass
+
+
 def start_job(kind: str, work) -> Job:
     job = Job(kind)
     JOBS[job.id] = job
@@ -257,6 +269,7 @@ class State:
         self.replays = None
         self.maps = None
         self.infos: dict = {}
+        self.db_mtime: float | None = None
         self.habits_cache: dict = {}
 
     def load(self, settings: dict, force: bool = False):
@@ -268,9 +281,27 @@ class State:
                 self.osu_dir = osu_dir
                 self.index = BeatmapIndex(osu_dir)
                 self.replays = ReplayIndex(osu_dir, self.index)
-                self.maps = read_osu_db(osu_dir / "osu!.db")
-                self.infos = {m.md5: m for m in self.maps}
+                self._read_db()
+            elif self._db_mtime() != self.db_mtime:     # osu! saved it (it does when it closes): new maps
+                self._read_db()
             return self
+
+    def _db_mtime(self) -> float | None:
+        try:
+            return (self.osu_dir / "osu!.db").stat().st_mtime
+        except OSError:
+            return None
+
+    def _read_db(self):
+        from .mapdb import read_osu_db
+        self.db_mtime = self._db_mtime()
+        self.maps = read_osu_db(self.osu_dir / "osu!.db")
+        self.infos = {m.md5: m for m in self.maps}
+
+    def songs_maps(self) -> list:
+        """The maps in Songs: osu!.db's, and those downloaded by osu!coach that osu! hasn't put in it yet."""
+        extra = [m for m in downloaded_maps(self.osu_dir) if m.md5 not in self.infos]
+        return self.maps + extra
 
 
 STATE = State()
@@ -421,13 +452,8 @@ def fetch_replay_map(job: Job, settings: dict, replay_id: str) -> dict:
     if res["failed"]:
         raise UserError(f"The map couldn't be downloaded: {res['failed'][0]['error']}")
     job.step("Unpacking the map into Songs")
-    for osz in songs_dir(st.osu_dir).glob(f"{set_id} *.osz"):
-        folder = osz.with_suffix("")
-        with zipfile.ZipFile(osz) as z:
-            for member in z.infolist():
-                if folder.resolve() in (folder / member.filename).resolve().parents:   # nothing outside the folder
-                    z.extract(member, folder)
-        osz.unlink()
+    for osz in songs_dir(st.osu_dir).glob(f"{set_id} *.osz"):     # sets downloaded before they were unpacked
+        unpack_osz(osz)
     st.index._by_md5 = None     # look at Songs again
     FETCHED_MAPS.add(h["md5"])
     if not st.index.find(h["md5"]):
@@ -1161,7 +1187,8 @@ def search_maps(job: Job, settings: dict, q: dict) -> dict:
 
     note = ""
     if "songs" in sources:
-        items = [(m, mods) for m in st.maps if m.mode == 0 and m.status in statuses and m.drain_s >= rc.MIN_DRAIN_S
+        adopt_osz(job, st)
+        items = [(m, mods) for m in st.songs_maps() if m.mode == 0 and m.status in statuses and m.drain_s >= rc.MIN_DRAIN_S
                  and (not q.get("unplayed") or m.unplayed)
                  and all(w in f"{m.artist} {m.title} {m.version} {m.creator}".lower() for w in words) for mods in mod_sets
                  if star_ok(m.stars.get(rc._star_key(mods))) and rc.in_ranges(m, mods, ranges)]
@@ -1185,7 +1212,7 @@ def search_maps(job: Job, settings: dict, q: dict) -> dict:
         except api.ApiError as e:
             raise UserError(f"osu! API: {e}. Set it up in Settings.")
         guessed = rc.load_predicted()
-        local = {m.md5 for m in st.maps}
+        local = {m.md5 for m in st.songs_maps()}
         searches = []
         for mods in mod_sets:
             if mods & ~int(Mods.DoubleTime):
@@ -1223,9 +1250,10 @@ def search_maps(job: Job, settings: dict, q: dict) -> dict:
                            if n + 1 < len(batches) else [])
                 got = []
                 for (info, mods, bs), fut in zip(batch, current):
-                    job.check()
                     try:
-                        info.path = str(fut.result())
+                        info.path = str(wait_for(job, fut))
+                    except Cancelled:
+                        raise
                     except Exception:
                         continue
                     downloaded += 1
@@ -1256,7 +1284,7 @@ def search_maps(job: Job, settings: dict, q: dict) -> dict:
                         continue
                     progress()
                     try:
-                        page = (x["next"] or pager.submit(client.search, x["query"], x["status"], x["cursor"])).result()
+                        page = wait_for(job, x["next"] or pager.submit(client.search, x["query"], x["status"], x["cursor"]))
                     except api.ApiError as e:
                         raise UserError(f"osu! API: {e}")
                     pages += 1
@@ -1353,7 +1381,7 @@ def recommend_maps(job: Job, settings: dict, q: dict) -> dict:
     model = player_model(job, settings)
     share = lambda sk: model.usual_shares.get(rc.SKILLS[sk][1], 0.0)
     targets = [s for s in q.get("include", []) if s in rc.SKILLS] or sorted(rc.SKILLS, key=lambda sk: -share(sk))[:3]
-    infos = {m.md5: m for m in st.maps}
+    infos = {m.md5: m for m in st.songs_maps()}
     owner_plays = st.replays.recent()
     band = rc.star_band(infos, [(e.md5, e.mods) for e in owner_plays[:int(settings["skill_plays"])]])
     if band is None:
@@ -1364,7 +1392,7 @@ def recommend_maps(job: Job, settings: dict, q: dict) -> dict:
 
     items = []
     if "songs" in sources:
-        items = rc.candidates(st.maps, {e.md5 for e in owner_plays}, band, mod_sets, statuses)
+        items = rc.candidates(st.songs_maps(), {e.md5 for e in owner_plays}, band, mod_sets, statuses)
     if "online" in sources:
         from . import api, online, typeguess
         try:
@@ -1482,8 +1510,102 @@ def load_elo() -> dict | None:
 
 # --- downloads --------------------------------------------------------------------------------------------------
 
+DOWNLOADED_PATH = CACHE_DIR / "ui_downloaded_maps.json"   # maps downloaded by osu!coach: their osu!.db-like info
+
+
+def unpack_osz(osz: Path) -> Path:
+    """An .osz unpacked into a folder of the same name next to it (as osu! does), the .osz removed."""
+    import zipfile
+    folder = osz.with_suffix("")
+    with zipfile.ZipFile(osz) as z:
+        for member in z.infolist():
+            if folder.resolve() in (folder / member.filename).resolve().parents:   # nothing outside the folder
+                z.extract(member, folder)
+    osz.unlink()
+    return folder
+
+
+def remember_downloaded(set_id: int, folder: Path, songs: Path):
+    """Each difficulty of a downloaded set with what osu!.db would say about it (stars, AR, BPM... from the osu!
+    API), so searching Songs finds it before osu! imports it. Without API credentials, nothing is kept."""
+    import hashlib
+    from dataclasses import asdict
+    from . import api, online
+    try:
+        bs = api.OsuApi().get(f"/beatmapsets/{set_id}")
+    except api.ApiError:
+        return
+    files = {hashlib.md5(p.read_bytes()).hexdigest(): p for p in folder.rglob("*.osu")}
+    try:
+        kept = json.loads(DOWNLOADED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        kept = {}
+    for bm in bs.get("beatmaps", []):
+        p = files.get(bm.get("checksum") or "")
+        if p is None or bm.get("mode_int", 0) != 0:
+            continue
+        info = online._info(bm, bs)
+        info.path = p.relative_to(songs).as_posix()
+        kept[info.md5] = asdict(info)
+    DOWNLOADED_PATH.write_text(json.dumps(kept), encoding="utf-8")
+
+
+def adopt_osz(job: Job, st):
+    """Maps in Songs that osu!.db doesn't list yet (osu! writes it when it closes): the .osz files waiting for osu! to
+    import them, unpacked; and the set folders osu! imported (F5) or that were added by hand, remembered with their
+    info from the osu! API, so searching Songs finds them. Each set once."""
+    songs = songs_dir(st.osu_dir)
+    waiting = sorted(p for p in songs.glob("*.osz") if p.is_file())    # some map folders are named *.osz too
+    for n, osz in enumerate(waiting):
+        job.step("Unpacking the downloaded maps waiting in Songs", n, len(waiting))
+        try:
+            unpack_osz(osz)
+        except Exception:      # a broken or half-written .osz: left for osu!
+            continue
+    known = {m.set_id for m in st.maps} | {m.set_id for m in downloaded_maps(st.osu_dir)} | tried_sets()
+    new = []
+    for folder in songs.iterdir():
+        set_id = re.match(r"(\d+) ", folder.name)
+        if folder.is_dir() and set_id and int(set_id.group(1)) not in known and any(folder.glob("*.osu")):
+            new.append((int(set_id.group(1)), folder))
+    for n, (set_id, folder) in enumerate(new):
+        job.step("Adding the new maps in Songs", n, len(new))
+        remember_downloaded(set_id, folder, songs)
+    if new:     # sets the API doesn't have (or not now) aren't asked for again at every search
+        TRIED_PATH.write_text(json.dumps(sorted(tried_sets() | {set_id for set_id, _ in new})), encoding="utf-8")
+    if new:
+        st.index._by_md5 = None     # look at Songs again: the new maps can be analysed
+
+
+TRIED_PATH = CACHE_DIR / "ui_songs_sets_tried.json"     # set folders of Songs already looked up on the osu! API
+
+
+def tried_sets() -> set[int]:
+    try:
+        return set(json.loads(TRIED_PATH.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return set()
+
+
+def downloaded_maps(osu_dir: Path) -> list:
+    """The maps osu!coach downloaded that are still in Songs."""
+    from .mapdb import MapInfo
+    try:
+        kept = json.loads(DOWNLOADED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    songs = songs_dir(osu_dir)
+    out = []
+    for d in kept.values():
+        d = dict(d, stars={int(k): v for k, v in d.get("stars", {}).items()})
+        if (songs / d["path"]).exists():
+            out.append(MapInfo(**d))
+    return out
+
+
 def download_sets(job: Job, settings: dict, sets: list[dict]) -> dict:
-    """.osz of each beatmapset into Songs (osu! imports them at the next start or F5 in song select)."""
+    """Each beatmapset into Songs, unpacked as osu! does (osu! adds it at the next start or F5 in song select), and
+    remembered so searching Songs finds it at once."""
     st = STATE.load(settings)
     target = songs_dir(st.osu_dir)
     mirror = settings["search"]["mirror"] or DEFAULT_SETTINGS["search"]["mirror"]
@@ -1507,6 +1629,8 @@ def download_sets(job: Job, settings: dict, sets: list[dict]) -> dict:
                         job.check()
                         f.write(chunk)
             tmp.replace(path)
+            folder = unpack_osz(path)
+            remember_downloaded(set_id, folder, target)
             done.append(set_id)
         except Cancelled:
             path.with_suffix(".part").unlink(missing_ok=True)
@@ -1515,6 +1639,7 @@ def download_sets(job: Job, settings: dict, sets: list[dict]) -> dict:
             path.with_suffix(".part").unlink(missing_ok=True)
             failed.append({"set_id": set_id, "error": str(e)})
     job.step("Done", len(sets), len(sets))
+    st.index._by_md5 = None     # look at Songs again: the new maps can be analysed
     return {"done": done, "failed": failed, "folder": str(target)}
 
 

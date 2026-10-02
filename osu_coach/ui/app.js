@@ -72,10 +72,16 @@ function progressBox(title) {
   const bar = h("div.bar.indet", fill);
   const cancel = h("button.btn.sm.ghost", "Stop");
   const el = h("div.progress", h("div.lbl", h("div.row", h("div.spinner"), lbl), h("div.row", cnt, cancel)), bar);
-  let jobId = null;
-  cancel.addEventListener("click", () => { if (jobId) api(`job/${jobId}/cancel`, {}); cancel.disabled = true; });
+  let jobId = null, stop;
+  const stopped = new Promise(resolve => { stop = resolve; });
+  cancel.addEventListener("click", () => {
+    if (jobId) api(`job/${jobId}/cancel`, {}).catch(() => {});
+    cancel.disabled = true;
+    lbl.textContent = "Stopping…";
+    stop();
+  });
   return {
-    el,
+    el, stopped,
     attach(id) { jobId = id; },
     update(j) {
       if (j.label) lbl.textContent = j.label;
@@ -91,17 +97,26 @@ function progressBox(title) {
   };
 }
 
+/** Run a job and follow it. Stop (the box's button) ends the wait at once, without waiting for the server to
+    notice: the error then has .stopped and the last partial result. */
 async function runJob(route, body, box, onPartial) {
   const job = await api(route, body);
   box?.attach(job.id);
+  let partial = null, stopped = false;
+  const never = new Promise(() => {});
+  box?.stopped?.then(() => { stopped = true; });
+  const halt = () => Object.assign(new Error("Stopped."), { stopped: true, partial });
   for (;;) {
-    await sleep(350);
+    await Promise.race([sleep(350), box?.stopped || never]);
+    if (stopped) throw halt();
     const j = await api("job/" + job.id);
+    if (stopped) throw halt();
     box?.update(j);
+    if (j.partial) partial = j.partial;
     if (onPartial && j.partial) onPartial(j.partial);
     if (j.status === "done") return j.result;
     if (j.status === "error") throw new Error(j.error);
-    if (j.status === "cancelled") throw new Error("Stopped.");
+    if (j.status === "cancelled") throw halt();
   }
 }
 
@@ -871,7 +886,8 @@ function buildReplays(root) {
     for (const p of a.priorities) for (const e of p.episodes) sections.push({ start: e.time - 1200, end: e.time + 2200, label: `${CAT_NAMES[p.category] || p.name}: ${e.title}` });
     const vwrap = h("div", { style: { marginTop: "16px" } });
     content.append(vwrap);
-    R.viewer = new ReplayViewer(vwrap, a.viewer, { sections, skin: loadSkin(), musicOffset: () => S.state.settings.viewer.offset });
+    R.viewer = new ReplayViewer(vwrap, a.viewer, { sections, skin: loadSkin(), musicOffset: () => S.state.settings.viewer.offset,
+      cursorSize: () => S.state.settings.viewer.cursor_size });
     const focus = t => { R.viewer.focus(t - 1500, t + 2500); vwrap.scrollIntoView({ behavior: "smooth", block: "start" }); };
 
     // problems
@@ -1156,15 +1172,18 @@ function buildSearch(root) {
   });
 
   // a share slider for each included skillset that has a share of the notes: at least this much of them
+  // stops: any, then from SHARE_FIRST% up in 5% steps (the slider's first stop, SHARE_FIRST - 5, stands for "any")
+  const SHARE_FIRST = 25;
   const SHARED = ["jump", "stream", "alt", "finger control", "tech"];
   const shares = { min: {} };
   const shareBox = h("div.share-sliders");
   function paintShares() {
     put(shareBox, SHARED.filter(sk => skillState[sk] === 1).map(sk => {
-      const input = h("input.slider-single", { type: "range", min: 0, max: 100, step: 5, value: shares.min[sk] ?? 0 });
+      const input = h("input.slider-single", { type: "range", min: SHARE_FIRST - 5, max: 100, step: 5,
+        value: shares.min[sk] ? shares.min[sk] : SHARE_FIRST - 5 });
       const val = h("span.val");
       const show = () => {
-        const v = +input.value;
+        const v = +input.value < SHARE_FIRST ? 0 : +input.value;
         shares.min[sk] = v;
         val.textContent = v === 0 ? "any" : `at least ${v}%`;
         val.classList.toggle("any", v === 0);
@@ -1281,7 +1300,10 @@ function buildSearch(root) {
       const res = await runJob("search", q, box, partial => renderResults({ maps: partial, total: partial.length, note: "" }, true));
       renderResults(res, false);
     } catch (e) {
-      toast(e.message, true);
+      if (e.stopped) {    // what was found so far stays
+        const maps = Array.isArray(e.partial) ? e.partial : e.partial?.maps || [];
+        renderResults({ maps, total: maps.length, note: "Search stopped." }, false, true);
+      } else toast(e.message, true);
     } finally {
       put(prog);
       running = false; goBtn.disabled = false;
@@ -1731,9 +1753,11 @@ function buildSettings(root) {
   const musicOffset = sensSlider("Music offset", "Raise it if the viewer's music comes late, lower it if it comes early.",
     vc.offset ?? 0, -100, 100, 1, " ms");
   musicOffset.el.querySelector("input").classList.add("no-fill");   // 0 is the middle: no side is "filled"
+  const cursorSize = sensSlider("Cursor size", "The cursor in the replay viewer (the skin's, or the one drawn by osu!coach), as a multiple of its usual size.",
+    vc.cursor_size ?? 1, 0.5, 2, 0.1, "x");
   wrap.append(h("div.card",
     h("div.card-head", h("div.ico", { html: ICON.play }), h("h3", "Replay viewer")),
-    h("label.field", "Skin", skinSel), skinNote, musicOffset.el));
+    h("label.field", "Skin", skinSel), skinNote, musicOffset.el, cursorSize.el));
 
   // profile
   const habitPlays = h("input.input.num", { type: "number", min: 10, max: 1000, value: cfg.habit_plays });
@@ -1772,7 +1796,7 @@ function buildSettings(root) {
           limit: +sLimit.value || 30, max_pages: +sPages.value || 100, mirror: sMirror.value.trim(), tag_min_pct: sTag.get(), reading_max_ar: sReadAr.get() },
         advice: Object.fromEntries(Object.entries(sl).map(([k, v]) => [k, v.get()])),
         skills: { stream_ur_tolerance_pct: urTol.get() },
-        viewer: { skin: skinSel.value, offset: musicOffset.get() },
+        viewer: { skin: skinSel.value, offset: musicOffset.get(), cursor_size: cursorSize.get() },
       };
       try {
         const r = await api("settings", data);

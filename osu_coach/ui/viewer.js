@@ -9,6 +9,7 @@
   const KEY_COLOR = { 0: "rgba(255,255,255,.9)", 1: "#ff66aa", 2: "#66ccff", 3: "#c77dff" };
   const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1];            // playback speeds of the slider's ticks
   const TRAIL_MS = 140;
+  const PATH_MS = 500;                              // the cursor path: this much of real time before now
   const MUSIC_DRIFT = 120;                          // ms the song may drift from the replay before it's re-seeked
   // slider % -> gain: a curve like the ear hears it, and quieter overall (100% = 40% of full scale)
   const gain = v => .4 * (v / 100) ** 2;
@@ -329,9 +330,12 @@
       this.aimChk = el("label", "check small", `<input type="checkbox"> aim meter along the movement`);
       this.aimChk.title = "Turn every click so the movement into the note points up: below the centre = short, above = past it";
       this.aimChk.querySelector("input").addEventListener("change", e => { this.aimTurned = e.target.checked; this.draw(); });
+      this.pathChk = el("label", "check small", `<input type="checkbox"> cursor path`);
+      this.pathChk.title = "The cursor's path over the last 0.5 s, coloured by the keys held: none, K1, K2, both";
+      this.pathChk.querySelector("input").addEventListener("change", e => { this.cursorPath = e.target.checked; this.draw(); });
       const help = el("div", "small muted", `<span class="kbd">space</span> play · <span class="kbd">← →</span> 1 s · <span class="kbd">,</span> <span class="kbd">.</span> frame`);
       this.stage.appendChild(strip);
-      bar.append(this.playBtn, this.timeLbl, this.tl, speeds, volumes, this.loopChk, this.aimChk, help);
+      bar.append(this.playBtn, this.timeLbl, this.tl, speeds, volumes, this.loopChk, this.aimChk, this.pathChk, help);
       this.root.append(this.stage, bar);
       this.syncButton();
     }
@@ -383,6 +387,29 @@
     syncLoop() { this.loopChk.classList.toggle("hidden", !this.loop); if (this.loop) this.loopChk.querySelector("input").checked = true; }
 
     seek(t) { this.now = clamp(t, this.start, this.end); this.soundDone = null; this.draw(); }
+
+    /** Cursor size from Settings (opts.cursorSize, read live): a multiplier of the cursor's usual size (the cursor
+        only: its trail and the cursor path keep their own). */
+    get cursorSize() { return clamp(+(this.opts.cursorSize?.() ?? 1) || 1, 0.5, 2); }
+
+    /** The cursor's path over the last PATH_MS of real time, each piece coloured by the keys held then, fading. */
+    drawCursorPath(ctx, now) {
+      const f = this.d.frames, span = PATH_MS * this.d.rate;
+      const from = Math.max(0, lowerBound(f.t, now - span) - 1), to = lowerBound(f.t, now);
+      if (to - from < 2) return;
+      ctx.save();
+      ctx.lineCap = "round"; ctx.lineJoin = "round";
+      ctx.lineWidth = 2.4;
+      for (let i = from + 1; i < to; i++) {
+        ctx.globalAlpha = .25 + .65 * clamp(1 - (now - f.t[i]) / span, 0, 1);
+        ctx.strokeStyle = KEY_COLOR[f.k[i] & 3];
+        ctx.beginPath(); ctx.moveTo(f.x[i - 1], f.y[i - 1]); ctx.lineTo(f.x[i], f.y[i]); ctx.stroke();
+      }
+      const cur = this.cursorAt(now);
+      ctx.globalAlpha = .9; ctx.strokeStyle = KEY_COLOR[cur.k];
+      ctx.beginPath(); ctx.moveTo(f.x[to - 1], f.y[to - 1]); ctx.lineTo(cur.x, cur.y); ctx.stroke();
+      ctx.restore();
+    }
 
     /** Music offset in ms from Settings (opts.musicOffset, read live): positive = the song earlier. */
     get musicOffset() { return clamp(+(this.opts.musicOffset?.() ?? 0) || 0, -100, 100); }
@@ -534,6 +561,7 @@
       }
       this.drawJudgements(ctx, now, r);
       this.drawClicks(ctx, now);
+      if (this.cursorPath) this.drawCursorPath(ctx, now);
       this.drawCursor(ctx, now);
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       this.drawHud(ctx, cw, ch, now);
@@ -725,7 +753,7 @@
     drawCursor(ctx, now) {
       const f = this.d.frames;
       if (!f.t.length) return;
-      const sk = this.skin;
+      const sk = this.skin, size = this.cursorSize;
       if (sk?.has("cursor")) {
         const centred = sk.ini.cursor_centre !== false;
         if (sk.has("cursortrail")) {
@@ -733,8 +761,8 @@
             sk.sprite(ctx, "cursortrail", f.x[i], f.y[i], .8, clamp(1 - (now - f.t[i]) / TRAIL_MS, 0, 1) * .8, null, 0, centred);
         }
         const cur = this.cursorAt(now);
-        sk.sprite(ctx, "cursor", cur.x, cur.y, cur.k ? .9 : .8, 1, null, 0, centred);
-        if (sk.has("cursormiddle")) sk.sprite(ctx, "cursormiddle", cur.x, cur.y, .8, 1, null, 0, centred);
+        sk.sprite(ctx, "cursor", cur.x, cur.y, (cur.k ? .9 : .8) * size, 1, null, 0, centred);
+        if (sk.has("cursormiddle")) sk.sprite(ctx, "cursormiddle", cur.x, cur.y, .8 * size, 1, null, 0, centred);
         return;
       }
       const from = Math.max(0, lowerBound(f.t, now - TRAIL_MS) - 1), to = lowerBound(f.t, now);
@@ -756,7 +784,7 @@
         ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(cur.x, cur.y); ctx.stroke();
       }
       ctx.globalAlpha = 1;
-      ctx.beginPath(); ctx.arc(cur.x, cur.y, cur.k ? 8 : 6.5, 0, Math.PI * 2);
+      ctx.beginPath(); ctx.arc(cur.x, cur.y, (cur.k ? 8 : 6.5) * size, 0, Math.PI * 2);
       ctx.fillStyle = cur.k ? KEY_COLOR[cur.k] : "#ffd1e6"; ctx.fill();
       ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke();
       ctx.shadowBlur = 0;

@@ -204,12 +204,12 @@ def remember(results) -> int:
     maptypes.types(), NM and DT only. They go to the training's labels and replace the maps' guesses, so
     guess, search and recommend show the real type from then on. Returns how many were new."""
     import json
-    from .recommend import PREDICTED_TYPES, load_predicted
+    from .recommend import load_predicted
     try:
         done = json.loads(LOWCONF.read_text())
     except (OSError, ValueError):
         done = {}
-    guessed = load_predicted()
+    guessed = {}
     new = 0
     for m, mods, a in results:
         name = {0: "NM", 64: "DT"}.get(mods)
@@ -222,5 +222,5 @@ def remember(results) -> int:
         guessed[f"{m.beatmap_id}:{name}"] = real_guess(a)
     LOWCONF.parent.mkdir(parents=True, exist_ok=True)
     LOWCONF.write_text(json.dumps(done))
-    PREDICTED_TYPES.write_text(json.dumps(guessed), encoding="utf-8")
+    load_predicted().update(guessed)
     return new

@@ -17,20 +17,21 @@
 
 import hashlib
 import json
-import math
 import os
+from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 
 import numpy as np
 
+from .cachedb import Store
 from .locate import CACHE_DIR
 from .mapdb import MapInfo
 from .model import COMPONENT_NAMES, COMPONENTS, UnifiedModel
 from .mods import Mods, mods_string
 
-CONTENT_CACHE = CACHE_DIR / "map_content.json"
-PROFILE_CACHE = CACHE_DIR / "map_profiles.json"
+CONTENT_CACHE = CACHE_DIR / "map_content.db"
+PROFILE_CACHE = CACHE_DIR / "map_profiles.db"
 CONTENT_VERSION = "3"                # bump when map_content changes
 ACCEPTED_STATUS = (4, 5)             # ranked, approved
 LOVED_STATUS = 7                     # optional: loved maps include exploit maps (usually with extreme star ratings)
@@ -42,6 +43,7 @@ BREAK_MAX = 0.40                     # stream maps: streams broken more often th
 TAP_WINDOW_BELOW, TAP_WINDOW_ABOVE = 5, 10   # BPM around the player's stream-timing comfort .. limit
 DEFAULT_MODS = (0, int(Mods.DoubleTime))
 FAST_TAP_MS = 150                    # rhythm changes between notes this close are finger control
+FAST_RUN_BPM = 165                   # slower runs count in no score: not kept
 LADDER = 15
 PROFILE_MAX = 400                    # maps profiled per skill: those where it takes most of the notes
 # skill -> (map type name, the unified model's component its misses are counted in)
@@ -67,11 +69,11 @@ WORKERS = max((os.cpu_count() or 2) // 2, 1)   # leave the machine usable while 
 
 def map_content(samples) -> dict:
     """What the map is made of, from the map alone: raw enough that the scores (see `scores`)
-    can change without reading every map again."""
+    can change without reading every map again (runs from FAST_RUN_BPM)."""
     from .features import FIRST, IRREGULAR, RHYTHM_CHANGE_RATIO, RUN_PATTERNS
     runs = {}
     for s in samples:
-        if s.f.run_length >= 2 and s.f.bpm:
+        if s.f.run_length >= 2 and s.f.bpm and s.f.bpm >= FAST_RUN_BPM:
             runs.setdefault(s.run_id, (s.f.bpm, s.f.run_length, s.f.run_spacing))
     rhythm = rhythm_fast = 0
     for a, b in zip(samples, samples[1:]):
@@ -104,6 +106,13 @@ def _content_job(args):
     return map_content(samples) if samples else None
 
 
+def _compact_content(c: dict) -> dict:
+    """The runs as one array of (BPM, length, spacing), the fast ones only: a list of lists per run takes ten
+    times the memory, for every candidate of a search."""
+    runs = np.asarray(c["runs"], dtype=np.float64).reshape(-1, 3)
+    return dict(c, runs=runs[runs[:, 0] >= FAST_RUN_BPM])
+
+
 def scores(c: dict) -> dict[str, float]:
     """How much of each skill the map trains.
 
@@ -113,14 +122,15 @@ def scores(c: dict) -> dict[str, float]:
             close notes: what makes the fingers switch; slow groups between jumps are aim
     aim     cursor speed on the notes that aren't streams (alt and jump aim)"""
     n = max(c["notes"], 1)
-    runs = c["runs"]
-    long_fast = [(b, l) for b, l, _ in runs if l >= 8 and b >= 180]
-    tap_notes = sum(l for _, l in long_fast)
+    b, l, sp = np.asarray(c["runs"], dtype=np.float64).reshape(-1, 3).T
+    long_fast = (l >= 8) & (b >= 180)
+    tap_notes = float(l[long_fast].sum())
+    fast = b >= FAST_RUN_BPM
     return {
         "tap share": tap_notes / n,
-        "tap bpm": sum(b * l for b, l in long_fast) / tap_notes if tap_notes else 0.0,
-        "flow": sum(l * min(max(sp - 0.8, 0.0), 3.0) for b, l, sp in runs if l >= 4 and b >= 165) / n,
-        "finger": (sum(l for b, l, _ in runs if l <= 9 and b >= 165) + c["rhythm fast"]) / n,
+        "tap bpm": float((b * l)[long_fast].sum()) / tap_notes if tap_notes else 0.0,
+        "flow": float((l * np.clip(sp - 0.8, 0.0, 3.0))[(l >= 4) & fast].sum()) / n,
+        "finger": (float(l[(l <= 9) & fast].sum()) + c["rhythm fast"]) / n,
         "aim": (c["aim"]["alt"][1] + c["aim"]["jump"][1]) / 10 / n,
     }
 
@@ -145,25 +155,24 @@ def tap_timing(model: UnifiedModel, bpm: float) -> float | None:
 
 # --- the player's side ----------------------------------------------------------------
 
-def stream_break(model: UnifiedModel, runs: list, kind: str) -> float | None:
+def stream_break(model: UnifiedModel, runs, kind: str) -> float | None:
     """Mean chance the player breaks the map's streams of this kind (weighted by length).
 
     kind "tap": long streams (8+ notes, 180+ BPM); "flow": streams spaced wider than a radius."""
     if not model.stream_runs:
         return None
     b0, b_bpm, b_len, b_sp = model.stream_runs
-    total = weight = 0.0
-    for bpm, length, spacing in runs:
-        if length < 4 or bpm < 165:
-            continue
-        if kind == "tap" and not (length >= 8 and bpm >= 180):
-            continue
-        if kind == "flow" and spacing <= 1.0:
-            continue
-        z = b0 + b_bpm * (bpm - 180) / 10 + b_len * math.log(length) + b_sp * spacing
-        total += length / (1 + math.exp(-max(min(z, 30), -30)))
-        weight += length
-    return total / weight if weight else None
+    bpm, length, spacing = np.asarray(runs, dtype=np.float64).reshape(-1, 3).T
+    keep = (length >= 4) & (bpm >= FAST_RUN_BPM)
+    if kind == "tap":
+        keep &= (length >= 8) & (bpm >= 180)
+    if kind == "flow":
+        keep &= spacing > 1.0
+    bpm, length, spacing = bpm[keep], length[keep], spacing[keep]
+    if not len(length):
+        return None
+    z = b0 + b_bpm * (bpm - 180) / 10 + b_len * np.log(length) + b_sp * spacing
+    return float((length / (1 + np.exp(-np.clip(z, -30, 30)))).sum() / length.sum())
 
 
 @dataclass
@@ -302,41 +311,34 @@ def candidates(maps: list[MapInfo], played_md5: set[str], band: tuple[float, flo
     return out
 
 
-def _load(path, tag: str) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    return data if data.get("tag") == tag else {"tag": tag, "maps": {}}
-
-
-def _save(path, data: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data), encoding="utf-8")
-    tmp.replace(path)
-
-
-def _run_cached(path, tag: str, jobs: list[tuple[str, tuple]], worker, progress=None, label="") -> dict:
-    """Results by key, computing (in parallel) only the missing ones; saved as it goes."""
-    data = _load(path, tag)
-    known = data["maps"]
-    todo = [(k, a) for k, a in jobs if k not in known]
-    if todo:
-        with ProcessPoolExecutor(max_workers=WORKERS) as pool:
-            for n, res in enumerate(pool.map(worker, [a for _, a in todo], chunksize=8), 1):
-                known[todo[n - 1][0]] = asdict(res) if hasattr(res, "__dataclass_fields__") else res
-                if n % SAVE_EVERY == 0:  # an interrupted run keeps what it computed
-                    _save(path, data)
-                if progress and n % 250 == 0:
-                    progress(label, n, len(todo))
-        _save(path, data)
+def _run_cached(path, tag: str, jobs: list[tuple[str, tuple]], worker, progress=None, label="", decode=None) -> dict:
+    """Results by key, computing (in parallel) only the missing ones; saved as it goes (cachedb: only the keys
+    asked for are read). `decode` turns a stored result into the one returned (None stays None: a map that
+    couldn't be read)."""
+    def dec(v):
+        return decode(v) if decode and v is not None else v
+    with Store(path, tag, legacy=path.with_suffix(".json")) as db:
+        known = db.get_many((k for k, _ in jobs), lambda s: dec(json.loads(s)))
+        todo = list({k: a for k, a in jobs if k not in known}.items())
+        if todo:
+            new = {}
+            with ProcessPoolExecutor(max_workers=WORKERS) as pool:
+                for n, res in enumerate(pool.map(worker, [a for _, a in todo], chunksize=8), 1):
+                    k = todo[n - 1][0]
+                    new[k] = asdict(res) if hasattr(res, "__dataclass_fields__") else res
+                    known[k] = dec(new[k])
+                    if n % SAVE_EVERY == 0:  # an interrupted run keeps what it computed
+                        db.put_many(new)
+                        new = {}
+                    if progress and n % 250 == 0:
+                        progress(label, n, len(todo))
+            db.put_many(new)
     return {k: known.get(k) for k, _ in jobs}
 
 
 def contents(songs, items: list[tuple[MapInfo, int]], progress=None) -> dict[str, dict]:
     jobs = [(f"{m.md5}:{mods}", (m.md5, str(songs / m.path), mods)) for m, mods in items]
-    return _run_cached(CONTENT_CACHE, CONTENT_VERSION, jobs, _content_job, progress, "content")
+    return _run_cached(CONTENT_CACHE, CONTENT_VERSION, jobs, _content_job, progress, "content", _compact_content)
 
 
 def profiles(model: UnifiedModel, songs, items: list[tuple[MapInfo, int]], progress=None) -> dict[str, MapProfile]:
@@ -382,14 +384,55 @@ def has_skill(a: dict | None, skill: str) -> bool:
 
 
 PREDICTED_TYPES = CACHE_DIR / "predicted_types.json"   # map types guessed for maps not in Songs (typepred)
+PREDICTED_DB = CACHE_DIR / "predicted_types.db"       # the same, read one map at a time
 
 
-def load_predicted() -> dict[str, dict]:
+class Predicted(Mapping):
+    """Guessed types of maps not in Songs, by "beatmap id:NM|DT", from PREDICTED_DB. predicted_types.json (as
+    typepred writes it and the data zip ships it) is moved in whenever it changes; the real types of maps
+    downloaded since (typeguess.remember) go in the database only."""
+
+    def __init__(self):
+        self.store = Store(PREDICTED_DB)
+        try:
+            st = PREDICTED_TYPES.stat()
+        except OSError:
+            return
+        stamp = f"{st.st_mtime_ns}:{st.st_size}"
+        if self.store.meta("source") != stamp:
+            try:
+                data = json.loads(PREDICTED_TYPES.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return
+            with self.store.db:
+                self.store.db.execute("DELETE FROM maps")
+                self.store.put_many(data)
+                self.store.set_meta("source", stamp)
+
+    def __getitem__(self, key: str) -> dict:
+        if not self.store.has(key):
+            raise KeyError(key)
+        return self.store.get(key)
+
+    def __contains__(self, key) -> bool:
+        return self.store.has(key)
+
+    def __iter__(self):
+        return self.store.keys()
+
+    def __len__(self) -> int:
+        return len(self.store)
+
+    def items(self):
+        return self.store.items()
+
+    def update(self, values: dict[str, dict]):
+        self.store.put_many(values)
+
+
+def load_predicted() -> Predicted:
     """Guessed types of maps not in Songs, by "beatmap id:NM|DT"; empty when never computed."""
-    try:
-        return json.loads(PREDICTED_TYPES.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    return Predicted()
 
 
 def predicted_skill(p: dict | None, skill: str) -> bool | None:
