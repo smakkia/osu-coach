@@ -42,6 +42,7 @@ class ObjectResult:
     ticks_hit: int = 0
     slider_break_time: int | None = None  # first tick/repeat/end that was dropped
     slider_break_kind: str | None = None
+    points: list[tuple[int, str, bool]] = field(default_factory=list)   # every tick/repeat/end: (time, kind, hit)
     # spinner
     spins: int = 0
     spins_required: int = 0
@@ -312,7 +313,9 @@ class _Sim:
             if st.scored + st.missed < passed:
                 point = points[st.scored + st.missed]
         if point is not None:
-            if allowable and st.slide_start <= point.time:
+            hit = allowable and st.slide_start <= point.time
+            r.points.append((point.time, point.kind, hit))
+            if hit:
                 st.scored += 1
             else:
                 st.missed += 1

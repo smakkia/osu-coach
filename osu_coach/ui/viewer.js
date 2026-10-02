@@ -8,7 +8,16 @@
   const RES_COLOR = { 300: "#66ccff", 100: "#7ddc4f", 50: "#ffc93c", 0: "#ff4d6a" };
   const KEY_COLOR = { 0: "rgba(255,255,255,.9)", 1: "#ff66aa", 2: "#66ccff", 3: "#c77dff" };
   const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1];            // playback speeds of the slider's ticks
-  const TRAIL_MS = 140;
+  const TRAIL_MS = 200;                             // the skin's cursor trail: this much of real time before now
+  const DRAWN_TRAIL_MS = 140;                       // the trail osu!coach draws itself (no skin cursor)
+  const TRAIL_HZ = 120;                             // its sprites per second of real time (the replay has ~60 frames)
+  const TRAIL_MIN_GAP = 1.5;                        // osu!px: closer to the last sprite drawn, skipped
+  const LONG_TRAIL_MS = 400;                        // skins with a cursormiddle: how long their trail lasts
+  const LONG_TRAIL_GAP = 1 / 2.5;                   // skins with a cursormiddle: a trail sprite every this much of its width
+  const LONG_TRAIL_MAX = 3000;                      // at most this many sprites a frame (a cursor teleporting far)
+  // a trail sprite's alpha by age (0 new .. 1 gone): squared, since the sprites overlap and a linear fade still
+  // looks solid until the very end
+  const trailAlpha = age => .8 * Math.pow(clamp(1 - age, 0, 1), 2);
   const PATH_MS = 500;                              // the cursor path: this much of real time before now
   const MUSIC_DRIFT = 120;                          // ms the song may drift from the replay before it's re-seeked
   // slider % -> gain: a curve like the ear hears it, and quieter overall (100% = 40% of full scale)
@@ -21,6 +30,10 @@
   const STRIP_CONTROLS = 22;                        // css px on the strip's left kept for its + and - buttons
   const AIM_MS = 8000, AIM_MAX = 40;                // the aim error meter: the last clicks, fading
   const TOP_STRIP = 70;                             // css px kept free above the playfield for the strip
+  const HUD_REF = 800;                              // css px of stage width where the HUD has its base size
+  const HUD_MIN = .85, HUD_MAX = 2.5;               // ...scaled with the stage's width between these
+  const HUD_REF_FULL = 1280;                        // the same in full screen: a smaller HUD, more room for the play
+  const FULL_BIG = 1.3;                             // ...but the keys, the input strip and the aim meter this much bigger
   // slider bodies as osu! draws a legacy skin's: the border's share of the radius, the body's opacity, gradient steps
   const SLIDER_BORDER = .128, SLIDER_BODY_ALPHA = .7, SLIDER_STEPS = 10;
 
@@ -246,6 +259,7 @@
       }
       this.aimTurned = false;
       this.stripSpan = STRIP_DEFAULT;
+      this.comboTimes = d.combo ? d.combo.map(c => c[0]) : null;   // [time, combo] at each change (gui.combo_timeline)
       this.judged = objs.filter(o => o.res != null).slice().sort((a, b) => a.jt - b.jt);
       this.judgedTimes = this.judged.map(o => o.jt);
       // the hit error bar: circles and slider heads (coloured by the head's own judgement)
@@ -332,10 +346,24 @@
       this.aimChk.querySelector("input").addEventListener("change", e => { this.aimTurned = e.target.checked; this.draw(); });
       this.pathChk = el("label", "check small", `<input type="checkbox"> cursor path`);
       this.pathChk.title = "The cursor's path over the last 0.5 s, coloured by the keys held: none, K1, K2, both";
-      this.pathChk.querySelector("input").addEventListener("change", e => { this.cursorPath = e.target.checked; this.draw(); });
+      this.pathChk.querySelector("input").addEventListener("change", e => {
+        this.cursorPath = e.target.checked;
+        this.hideCurChk.classList.toggle("hidden", !this.cursorPath);
+        this.draw();
+      });
+      // only offered with the path on: without it there would be nothing left of the cursor
+      this.hideCurChk = el("label", "check small", `<input type="checkbox"> hide cursor`);
+      this.hideCurChk.title = "Draw only the cursor path, not the cursor itself";
+      this.hideCurChk.classList.add("hidden");
+      this.hideCurChk.querySelector("input").addEventListener("change", e => { this.hideCursor = e.target.checked; this.draw(); });
       const help = el("div", "small muted", `<span class="kbd">space</span> play · <span class="kbd">← →</span> 1 s · <span class="kbd">,</span> <span class="kbd">.</span> frame`);
       this.stage.appendChild(strip);
-      bar.append(this.playBtn, this.timeLbl, this.tl, speeds, volumes, this.loopChk, this.aimChk, this.pathChk, help);
+      // the timeline takes the whole first line, the speed, volumes and options go under it
+      this.full = false;
+      this.fullBtn = el("button", "btn icon-btn full-btn", "");
+      this.fullBtn.addEventListener("click", () => this.setFull(!this.full));
+      this.syncFull();
+      bar.append(this.playBtn, this.timeLbl, this.tl, this.fullBtn, el("div", "bar-break"), speeds, volumes, this.loopChk, this.aimChk, this.pathChk, this.hideCurChk, help);
       this.root.append(this.stage, bar);
       this.syncButton();
     }
@@ -345,10 +373,18 @@
       if (this.music) { this.music.pause(); this.music.src = ""; }
       document.removeEventListener("keydown", this.onKey);
       this.ro.disconnect();
+      this.setFull(false);
     }
 
     resize() {
       const dpr = window.devicePixelRatio || 1;
+      // the HUD (counts, keys, strip, aim meter, accuracy, combo, error bar) grows and shrinks with the stage
+      // by the stage's height too (the page's stage is 16:10): a wide full screen keeps the HUD the playfield's size
+      const sr = this.stage.getBoundingClientRect();
+      const ref = this.full ? HUD_REF_FULL : HUD_REF;
+      this.hud = clamp(Math.min(sr.width / ref, sr.height / (ref * 10 / 16)), HUD_MIN, HUD_MAX);
+      this.stage.style.setProperty("--hud", this.hud);
+      this.stage.style.setProperty("--strip", this.hud * (this.full ? FULL_BIG : 1));   // the strip's + and - buttons
       for (const [c, host] of [[this.canvas, this.stage], [this.tlCanvas, this.tl]]) {
         const r = host.getBoundingClientRect();
         c.width = Math.max(1, Math.round(r.width * dpr));
@@ -361,7 +397,8 @@
     onKey(e) {
       if (!this.root.isConnected) return;
       if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName)) return;
-      if (e.code === "Space") { e.preventDefault(); this.toggle(); }
+      if (e.key === "Escape" && this.full) { e.preventDefault(); this.setFull(false); }
+      else if (e.code === "Space") { e.preventDefault(); this.toggle(); }
       else if (e.key === "ArrowLeft") { e.preventDefault(); this.seek(this.now - 1000); }
       else if (e.key === "ArrowRight") { e.preventDefault(); this.seek(this.now + 1000); }
       else if (e.key === "," || e.key === ".") {
@@ -384,12 +421,38 @@
         ? `<svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>`
         : `<svg viewBox="0 0 24 24"><path d="M8 5.5v13l11-6.5z"/></svg>`;
     }
+    /** Full screen: the stage and its bar fill the app window, made full screen itself (opts.fullscreen: the
+        server toggles the pywebview window); Esc or the button again leaves it. */
+    setFull(on) {
+      if (this.full === on) return;
+      this.full = on;
+      // in full screen the viewer moves to <body>, over everything: nothing of the page around it can show through
+      // or limit it; it goes back where it was after
+      if (on) {
+        this.home = { parent: this.root.parentNode, next: this.root.nextSibling };
+        document.body.appendChild(this.root);
+      } else if (this.home) {
+        const { parent, next } = this.home;
+        if (next && next.parentNode === parent) parent.insertBefore(this.root, next); else parent.appendChild(this.root);
+        this.home = null;
+      }
+      this.root.classList.toggle("full", on);
+      document.body.classList.toggle("viewer-full", on);
+      Promise.resolve(this.opts.fullscreen?.(on)).catch(() => { });
+      this.syncFull();
+    }
+    syncFull() {
+      this.fullBtn.title = this.full ? "Leave full screen (Esc)" : "Full screen";
+      this.fullBtn.innerHTML = this.full
+        ? `<svg viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>`
+        : `<svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>`;
+    }
     syncLoop() { this.loopChk.classList.toggle("hidden", !this.loop); if (this.loop) this.loopChk.querySelector("input").checked = true; }
 
     seek(t) { this.now = clamp(t, this.start, this.end); this.soundDone = null; this.draw(); }
 
     /** Cursor size from Settings (opts.cursorSize, read live): a multiplier of the cursor's usual size (the cursor
-        only: its trail and the cursor path keep their own). */
+        and the skin's trail: the cursor path keeps its own). */
     get cursorSize() { return clamp(+(this.opts.cursorSize?.() ?? 1) || 1, 0.5, 2); }
 
     /** The cursor's path over the last PATH_MS of real time, each piece coloured by the keys held then, fading. */
@@ -508,7 +571,7 @@
       const bg = ctx.createRadialGradient(cw / 2, ch / 2, 0, cw / 2, ch / 2, Math.max(cw, ch) * .7);
       bg.addColorStop(0, "#1a1220"); bg.addColorStop(1, "#0b080e");
       ctx.fillStyle = bg; ctx.fillRect(0, 0, cw, ch);
-      const top = TOP_STRIP * (window.devicePixelRatio || 1);
+      const top = TOP_STRIP * (window.devicePixelRatio || 1) * (this.hud || 1) * (this.full ? FULL_BIG : 1);
       const pad = 36, s = Math.min(cw / (W + pad * 2), (ch - top) / (H + pad * 2 + 30));
       const ox = (cw - W * s) / 2, oy = top + (ch - top - H * s) / 2 - 8 * s;
       ctx.setTransform(s, 0, 0, s, ox, oy);
@@ -561,8 +624,8 @@
       }
       this.drawJudgements(ctx, now, r);
       this.drawClicks(ctx, now);
-      if (this.cursorPath) this.drawCursorPath(ctx, now);
-      this.drawCursor(ctx, now);
+      if (!(this.cursorPath && this.hideCursor)) this.drawCursor(ctx, now);
+      if (this.cursorPath) this.drawCursorPath(ctx, now);   // over the cursor: a big skin cursor would hide it
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       this.drawHud(ctx, cw, ch, now);
       this.drawPlayhead();
@@ -750,26 +813,69 @@
       ctx.globalAlpha = 1;
     }
 
+    /** The skin's cursor trail over the last TRAIL_MS of real time: the cursor every 1/TRAIL_HZ s (between the
+        replay's ~60 Hz frames, interpolated), on a fixed grid of times so the sprites don't shimmer; a sprite
+        too close to the last one drawn is skipped, so a still cursor doesn't pile them up. */
+    drawTrail(ctx, now, size, centred) {
+      if (this.skin.has("cursormiddle")) return this.drawLongTrail(ctx, now, size, centred);
+      const rate = this.d.rate, step = 1000 / TRAIL_HZ * rate, span = TRAIL_MS * rate;
+      const n = Math.floor(span / step);
+      let t = Math.floor(now / step) * step - n * step, lx = null, ly = null;
+      for (let i = 0; i <= n; i++, t += step) {
+        const age = (now - t) / span;
+        if (age < 0 || age > 1) continue;
+        const p = this.cursorAt(t);
+        if (lx !== null && Math.hypot(p.x - lx, p.y - ly) < TRAIL_MIN_GAP) continue;
+        this.skin.sprite(ctx, "cursortrail", p.x, p.y, .8 * size, trailAlpha(age), null, 0, centred);
+        lx = p.x; ly = p.y;
+      }
+    }
+
+    /** The "long trail" of skins with a cursormiddle, as osu! draws it: sprites along the cursor's path every
+        LONG_TRAIL_GAP of the sprite's width, however fast it moves, fading over LONG_TRAIL_MS of real time. The sprites
+        sit at fixed distances along the path from the replay's start, so they stay put as the trail moves on. */
+    drawLongTrail(ctx, now, size, centred) {
+      const f = this.d.frames, span = LONG_TRAIL_MS * this.d.rate, scale = .8 * size;
+      const gap = Math.max(this.skin.size("cursortrail")[0] * scale * LONG_TRAIL_GAP, 1);
+      if (this.pathLen?.frames !== f) {   // distance along the path at each frame
+        const c = new Float64Array(f.t.length);
+        for (let i = 1; i < c.length; i++) c[i] = c[i - 1] + Math.hypot(f.x[i] - f.x[i - 1], f.y[i] - f.y[i - 1]);
+        this.pathLen = { frames: f, c };
+      }
+      const c = this.pathLen.c, cur = this.cursorAt(now), last = lowerBound(f.t, now) - 1;
+      let drawn = 0;
+      for (let i = Math.max(0, lowerBound(f.t, now - span) - 1); i <= last && drawn < LONG_TRAIL_MAX; i++) {
+        // the piece from frame i to the next one, or to where the cursor is now
+        const end = i < last ? { x: f.x[i + 1], y: f.y[i + 1], t: f.t[i + 1] } : { x: cur.x, y: cur.y, t: now };
+        const len = Math.hypot(end.x - f.x[i], end.y - f.y[i]);
+        if (len <= 0) continue;
+        for (let k = Math.ceil(c[i] / gap); k * gap <= c[i] + len && drawn < LONG_TRAIL_MAX; k++, drawn++) {
+          const p = (k * gap - c[i]) / len, t = f.t[i] + (end.t - f.t[i]) * p;
+          const alpha = trailAlpha((now - t) / span);
+          if (alpha > 0) this.skin.sprite(ctx, "cursortrail", f.x[i] + (end.x - f.x[i]) * p, f.y[i] + (end.y - f.y[i]) * p,
+                                          scale, alpha, null, 0, centred);
+        }
+      }
+    }
+
     drawCursor(ctx, now) {
       const f = this.d.frames;
       if (!f.t.length) return;
       const sk = this.skin, size = this.cursorSize;
-      if (sk?.has("cursor")) {
+      // the skin's cursor: cursor and/or cursormiddle (skins with a "long trail" leave cursor.png empty, 1x1)
+      if (sk && (sk.has("cursor") || sk.has("cursormiddle"))) {
         const centred = sk.ini.cursor_centre !== false;
-        if (sk.has("cursortrail")) {
-          for (let i = Math.max(0, lowerBound(f.t, now - TRAIL_MS)); i < f.t.length && f.t[i] <= now; i++)
-            sk.sprite(ctx, "cursortrail", f.x[i], f.y[i], .8, clamp(1 - (now - f.t[i]) / TRAIL_MS, 0, 1) * .8, null, 0, centred);
-        }
+        if (sk.has("cursortrail")) this.drawTrail(ctx, now, size, centred);
         const cur = this.cursorAt(now);
         sk.sprite(ctx, "cursor", cur.x, cur.y, (cur.k ? .9 : .8) * size, 1, null, 0, centred);
         if (sk.has("cursormiddle")) sk.sprite(ctx, "cursormiddle", cur.x, cur.y, .8 * size, 1, null, 0, centred);
         return;
       }
-      const from = Math.max(0, lowerBound(f.t, now - TRAIL_MS) - 1), to = lowerBound(f.t, now);
+      const from = Math.max(0, lowerBound(f.t, now - DRAWN_TRAIL_MS) - 1), to = lowerBound(f.t, now);
       ctx.lineCap = "round";
       let px = null, py = null;
       for (let i = from; i < to; i++) {
-        const age = (now - f.t[i]) / TRAIL_MS;
+        const age = (now - f.t[i]) / DRAWN_TRAIL_MS;
         if (px !== null) {
           ctx.globalAlpha = clamp(1 - age, 0, 1) * .9;
           ctx.strokeStyle = KEY_COLOR[f.k[i] & 3];
@@ -791,7 +897,7 @@
     }
 
     drawHud(ctx, cw, ch, now) {
-      const dpr = window.devicePixelRatio || 1, u = dpr;
+      const dpr = window.devicePixelRatio || 1, u = dpr * (this.hud || 1);
       // counts so far
       const upto = lowerBound(this.judgedTimes, now + 1), counts = { 300: 0, 100: 0, 50: 0, 0: 0 };
       for (let i = 0; i < upto; i++) counts[this.judged[i].res] = (counts[this.judged[i].res] || 0) + 1;
@@ -809,26 +915,39 @@
       let k1 = 0, k2 = 0;
       for (let i = 0; i < pUpTo; i++) this.presses[i].key === 1 ? k1++ : k2++;
       const cur = this.cursorAt(now);
-      const boxes = [["K1", 1, k1], ["K2", 2, k2]];
+      const boxes = [["K1", 1, k1], ["K2", 2, k2]], ku = u * (this.full ? FULL_BIG : 1);   // full screen: bigger keys
       boxes.forEach(([name, bit, count], i) => {
-        const bw = 58 * u, bh = 38 * u, bx = cw - bw - 12 * u, by = ch / 2 - bh - 4 * u + i * (bh + 8 * u);
+        const bw = 58 * ku, bh = 38 * ku, bx = cw - bw - 12 * ku, by = ch / 2 - bh - 4 * ku + i * (bh + 8 * ku);
         const on = cur.k & bit;
         ctx.fillStyle = on ? KEY_COLOR[bit] : "rgba(255,255,255,.06)";
-        roundRect(ctx, bx, by, bw, bh, 8 * u); ctx.fill();
-        ctx.strokeStyle = on ? "#fff" : "rgba(255,255,255,.18)"; ctx.lineWidth = 1.5 * u; ctx.stroke();
+        roundRect(ctx, bx, by, bw, bh, 8 * ku); ctx.fill();
+        ctx.strokeStyle = on ? "#fff" : "rgba(255,255,255,.18)"; ctx.lineWidth = 1.5 * ku; ctx.stroke();
         ctx.fillStyle = on ? "#15101a" : "#cdbfd6";
         ctx.textAlign = "center"; ctx.textBaseline = "middle";
-        ctx.font = `700 ${11 * u}px "Segoe UI", sans-serif`;
+        ctx.font = `700 ${11 * ku}px "Segoe UI", sans-serif`;
         ctx.fillText(name, bx + bw / 2, by + bh * .32);
-        ctx.font = `600 ${12 * u}px "Cascadia Mono", Consolas, monospace`;
+        ctx.font = `600 ${12 * ku}px "Cascadia Mono", Consolas, monospace`;
         ctx.fillText(String(count), bx + bw / 2, by + bh * .7);
       });
       // the - and + buttons right after the counts, the strip right after them
       const controls = Math.max(x + 24 * u, cw * .34);
-      const left = `${Math.round(controls / u)}px`;
+      const left = `${Math.round(controls / dpr)}px`;
       if (this.stripControls.style.left !== left) this.stripControls.style.left = left;
-      this.drawKeyStrip(ctx, cw, now, u, controls + (STRIP_CONTROLS + 8) * u);
-      this.drawAimMeter(ctx, cw, ch, now, u);
+      const su = u * (this.full ? FULL_BIG : 1);   // full screen: a bigger input strip
+      this.drawKeyStrip(ctx, cw, now, su, controls + (STRIP_CONTROLS + 8) * su);
+      this.drawAimMeter(ctx, cw, ch, now, u * (this.full ? FULL_BIG : 1));
+      // accuracy so far (top right, under the input strip) and the combo (bottom left), as osu! shows them
+      const judged = counts[300] + counts[100] + counts[50] + counts[0];
+      const acc = judged ? (300 * counts[300] + 100 * counts[100] + 50 * counts[50]) / (300 * judged) : 1;
+      ctx.fillStyle = "#fff"; ctx.textAlign = "right"; ctx.textBaseline = "top";
+      ctx.font = `700 ${20 * u}px "Cascadia Mono", Consolas, monospace`;
+      ctx.fillText(`${(acc * 100).toFixed(2)}%`, cw - 18 * u, 52 * su);
+      if (this.comboTimes) {
+        const i = lowerBound(this.comboTimes, now + 1) - 1, combo = i >= 0 ? this.d.combo[i][1] : 0;
+        ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+        ctx.font = `700 ${30 * u}px "Cascadia Mono", Consolas, monospace`;
+        ctx.fillText(`${combo}x`, 14 * u, ch - 12 * u);
+      }
       // hit error bar
       const w = this.d.windows, bwid = Math.min(cw * .42, 380 * u), scale = bwid / 2 / w[2];
       const cx = cw / 2, cy = ch - 16 * u;
