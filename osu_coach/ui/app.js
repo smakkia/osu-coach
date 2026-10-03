@@ -307,29 +307,47 @@ function groupHabits(habits) {
   return [...groups.values()].sort((a, b) => b.impact - a.impact);
 }
 
+/** A number with its unit ("5.8%", "13.1px", "100x75 -> 94.2x70.7mm", "1.2 -> 1.27") in an advice text. */
+const ADVICE_NUM = /[+−-]?\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?)?(?:mm|px|%| deg|x\b)?(?: -> [+−-]?\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?)?(?:mm|px|%| deg)?)?/g;
+
+/** An advice text with its numbers highlighted ("->" as an arrow), but not the counts of hits. */
+function hiNums(text) {
+  const s = String(text ?? ""), out = [];
+  let last = 0;
+  for (const m of s.matchAll(ADVICE_NUM)) {
+    if (s.startsWith(" hits", m.index + m[0].length)) continue;
+    out.push(s.slice(last, m.index), h("span.num", m[0].replace(" -> ", " → ")));
+    last = m.index + m[0].length;
+  }
+  out.push(s.slice(last));
+  return out;
+}
+
 function adviceCard(title, ico, items, emptyText, top) {
   return h("div.card",
     h("div.card-head", h("div.ico", { html: ICON[ico] }), h("h3", title)),
     top || null,
     items.length ? items.map(i => h("div.advice-item",
-      h("div.row", h("b", i.title), i.kind === "info" ? h("span.chip.green", "ok") : h("span.chip.pink", "change")),
-      h("p", i.detail))) : h("p.muted", { style: { margin: "8px 0 0" } }, emptyText));
+      h("div.row", h("b", hiNums(i.title)), i.kind === "info" ? h("span.chip.green", "ok") : h("span.chip.pink", "change")),
+      h("p", hiNums(i.detail)))) : h("p.muted", { style: { margin: "8px 0 0" } }, emptyText));
 }
 
 /** Overaim or underaim in one play (setup_advice.play_aim): a line over the area advice of the recent plays. */
 function playAimLine(p) {
   if (!p) return null;
   let text, color = "var(--text-2)";
-  if (p.scale == null) text = `Too few jumps in this play (${p.jumps}, at least ${p.min_jumps}) to measure overaim or underaim.`;
+  if (p.scale == null) text = `Only ${p.jumps} hits in this play: at least ${p.min_jumps} hits are needed to measure overaim or underaim.`;
   else {
     const pct = `${p.scale > 0 ? "+" : "−"}${Math.abs(p.scale * 100).toFixed(1)}%`;
-    if (Math.abs(p.scale) < p.ok) text = `In this play: on target (${pct} of the jump distance, ${p.jumps} jumps).`;
+    const where = `aim meter along the movement ${p.scale > 0 ? "above" : "below"} the centre, ${pct} of the distance, ${p.jumps} hits`;
+    if (Math.abs(p.scale) < p.ok) text = `In this play: on target (${where}).`;
+    else if (Math.abs(p.t ?? 0) < (p.t_min ?? 3)) text = `In this play: no clear overaim or underaim (${where}, but it changes too much from note to note).`;
     else {
-      text = `In this play: ${p.scale > 0 ? "overaim" : "underaim"} ${pct} of the jump distance (${p.jumps} jumps).`;
+      text = `In this play: ${p.scale > 0 ? "overaim" : "underaim"} (${where}).`;
       color = "var(--warn)";
     }
   }
-  return h("div.advice-item", h("p", { style: { margin: 0, color } }, text),
+  return h("div.advice-item", h("p", { style: { margin: 0, color } }, hiNums(text)),
     h("p.small.muted", { style: { margin: "4px 0 0" } }, "One play varies: the advice below comes from your recent plays."));
 }
 
@@ -622,7 +640,7 @@ function buildImprovement(root) {
   root.append(page);
   const sub = h("p", "Your rating in each skillset, day by day over the last 90 days.");
   const btn = h("button.btn.primary", { onclick: () => recompute() }, icon("refresh"), "Update");
-  const prog = h("div");
+  const prog = h("div.job-prog");   // the cards right under it have no margin of their own
   const body = h("div");
   page.append(h("div.page-head", h("div", h("h1", "Improvement"), sub), btn), prog, body);
 
@@ -689,14 +707,22 @@ function buildReplays(root) {
 
   const content = h("div.page");
   main.append(content);
-  content.append(h("div.card", emptyState("replay", "Pick a replay", "Select a replay from the list (or import one) and press Analyze.")));
+  content.append(h("div.card", emptyState("replay", "Pick a replay", "Select a replay from the list (or import one, or drop .osr files on the window) and press Analyze.")));
 
   search.addEventListener("input", () => filter());
   player.addEventListener("change", () => filter());
   list.addEventListener("scroll", () => { if (list.scrollTop + list.clientHeight > list.scrollHeight - 400) more(); });
   file.addEventListener("change", async () => {
+    const files = [...file.files];
+    file.value = "";
+    await importFiles(files);
+  });
+  S.importReplays = importFiles;   // for the .osr files dropped on the window
+
+  /** Copies .osr files into the imported replays, then selects the last one and analyses it. */
+  async function importFiles(files) {
     let last = null;
-    for (const f of file.files) {
+    for (const f of files) {
       try {
         const r = await fetch(`/api/import?name=${encodeURIComponent(f.name)}`, { method: "POST", body: await f.arrayBuffer() });
         const d = await r.json();
@@ -704,7 +730,6 @@ function buildReplays(root) {
         last = d.id;
       } catch (e) { toast(`${f.name}: ${e.message}`, true); }
     }
-    file.value = "";
     if (last) {
       await load(false);
       const row = R.rows.find(r => r.id === last);
@@ -714,7 +739,7 @@ function buildReplays(root) {
         else if (row.supported) fetchMap(row);
       }
     }
-  });
+  }
 
   async function load(reload) {
     count.textContent = "loading…";
@@ -1810,4 +1835,44 @@ function buildSettings(root) {
     } }, "Save settings")));
 }
 
+// --- replays dropped on the window -------------------------------------------------------------------------
+
+/** .osr files dragged onto the app go to the Replay page and are imported there; anything else dropped is
+    ignored (the web view would otherwise open the file in place of the app). */
+function setupDrop() {
+  const overlay = h("div.drop-overlay.hidden", h("div.drop-box", icon("upload"), h("b", "Drop replays to analyse them"),
+    h("div.small.muted", ".osr files")));
+  document.body.append(overlay);
+  const hasFiles = e => [...(e.dataTransfer?.types || [])].includes("Files");
+  const blocked = () => S.navLocked && S.current !== "replays";   // the other pages wait for the profile
+  let depth = 0;   // dragenter/dragleave also fire on every child crossed
+  document.addEventListener("dragenter", e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    if (depth++ === 0 && !blocked()) overlay.classList.remove("hidden");
+  });
+  document.addEventListener("dragleave", e => {
+    if (!hasFiles(e)) return;
+    if (--depth <= 0) { depth = 0; overlay.classList.add("hidden"); }
+  });
+  document.addEventListener("dragover", e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = blocked() ? "none" : "copy";
+  });
+  document.addEventListener("drop", e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    overlay.classList.add("hidden");
+    const all = [...e.dataTransfer.files];
+    const files = all.filter(f => f.name.toLowerCase().endsWith(".osr"));
+    if (!files.length) return toast(all.length ? "Only .osr replay files can be dropped here." : "Nothing to import.", true);
+    if (blocked()) return toast("Wait for the profile to be computed, then drop the replays again.", true);
+    show("replays");
+    if (S.current === "replays" && S.importReplays) S.importReplays(files);
+  });
+}
+
+setupDrop();
 boot();

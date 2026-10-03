@@ -1,11 +1,12 @@
 """Setup advice: tablet area / mouse sensitivity and keyboard (rapid trigger) settings.
 
-Aim calibration follows the idea of rgbeing/osu-aim-analyzer: regress the click
-error on the movement that led to the note. An error that grows in proportion
-to jump distance is a scaling problem (area / sensitivity); one that is
-rotated with the movement is a rotation problem. The area advice follows the
-sign of the mean scaling alone (the player's choice): underaim -> a smaller
-area, overaim -> a larger one, from the MIN_SCALE setting up.
+The area / sensitivity advice reads what the replay viewer's aim meter shows "along the movement": the
+hits of the notes the cursor moved at least a radius to, turned so the movement points up. Hits below the
+centre on average (underaim) -> a smaller area (a higher sensitivity), above it (overaim) -> a larger one
+(a lower sensitivity), from the MIN_SCALE setting up. The aspect ratio reads the plain meter: hits spread
+wider on one axis than the other, or notes near the playfield's edges over/undershot only on the axis of
+that edge, change only that side of the area. Rotation still regresses the sideways error on the distance
+(the idea of rgbeing/osu-aim-analyzer).
 """
 
 import math
@@ -14,17 +15,19 @@ from dataclasses import dataclass
 import numpy as np
 
 from .advice import MIN_EPISODES, Insight, Sample
-from .features import JUMP
 from .keys import TapStats
 from .setup import Setup
 
 MIN_JUMPS = 200
 MIN_SCALE = 0.03       # overaim/underaim below 3% of the distance isn't worth changing settings for
-MIN_AXIS_DIFF = 0.03
-ASPECT_AXIS = 1.5          # a jump is horizontal (vertical) when it moves this many times more along x (y)
-ASPECT_MIN_JUMPS = 100     # jumps each axis needs for the aspect ratio advice
-ASPECT_MIN_RATIO = 1.3     # one axis must miss this many times as often as the other...
+ASPECT_AXIS = 1.5          # a move is horizontal (vertical) when it goes this many times more along x (y)
+ASPECT_MIN_JUMPS = 100     # hits each axis needs for the aspect ratio advice
+ASPECT_MIN_SPREAD = 1.15   # the hits' spread on one axis must be this many times the other's...
 ASPECT_MIN_SCALE = 0.01    # ...and over/undershoot by at least this share of the distance to change that side
+PLAYFIELD_W, PLAYFIELD_H = 512, 384
+EDGE_MARGIN_X = 165        # osu! px from the left/right border a note counts as at its edge
+EDGE_MARGIN_Y = 100        # ...and from the top/bottom one
+EDGE_MIN_HITS = 30         # hits moving towards an edge each axis needs for the edge check
 MIN_ROTATION_DEG = 1.5
 MIN_OFFSET_RADII = 0.2
 T_MIN = 3.0
@@ -53,17 +56,18 @@ def _fit(x: np.ndarray, y: np.ndarray) -> _Fit | None:
     return _Fit(b[1], b[1] / se if se > 0 else 0.0, b[0])
 
 
-CLICK_COLUMNS = 12
+CLICK_COLUMNS = 14
 
 
 def jump_clicks(samples: list[Sample]) -> np.ndarray:
-    """Rows (distance, err_along, err_perp, move_x, move_y, err_x, err_y, speed, radius, play, missed, played_at)
-    for jumps clicked within 2 radii of the note (further clicks aren't aim, they're misreads); played_at: when the
+    """Rows (distance, err_along, err_perp, move_x, move_y, err_x, err_y, speed, radius, play, missed, played_at,
+    note_x, note_y) for the notes the aim meter turns along the movement (the cursor moved at least a radius to
+    them), clicked within 2 radii of the note (further clicks aren't aim, they're misreads); played_at: when the
     play was played (unix seconds, 0 if unknown), so the advice can leave out plays made before a setup change."""
     rows = []
     for s in samples:
         f, r = s.f, s.r
-        if f.pattern != JUMP or f.direction is None:
+        if f.direction is None or f.distance_radii < 1:
             continue
         click = r.cursor
         if click is None and r.off_target_clicks and s.wrong_note is None:
@@ -78,52 +82,69 @@ def jump_clicks(samples: list[Sample]) -> np.ndarray:
         dx, dy = f.direction
         rows.append((f.distance, ex * dx + ey * dy, -ex * dy + ey * dx, f.distance * dx, f.distance * dy,
                      ex, ey, f.distance / max(f.move_ms, 1.0), f._radius, s.play, float(s.missed),
-                     float(getattr(s, "played_at", 0.0))))
+                     float(getattr(s, "played_at", 0.0)), px, py))
     return np.array(rows) if rows else np.empty((0, CLICK_COLUMNS))
 
 
 def click_rows(clicks) -> np.ndarray:
-    """Saved clicks as an array; older ones (11 columns, no play time) get a 0 time."""
+    """Saved clicks as an array; older ones get a 0 play time (11 columns) and no note position (NaN)."""
     a = np.asarray(clicks, dtype=float)
     if a.size == 0:
         return np.empty((0, CLICK_COLUMNS))
     a = a.reshape(len(a), -1)
-    return np.column_stack([a, np.zeros(len(a))]) if a.shape[1] == CLICK_COLUMNS - 1 else a
+    if a.shape[1] == 11:
+        a = np.column_stack([a, np.zeros(len(a))])
+    if a.shape[1] == 12:
+        a = np.column_stack([a, np.full((len(a), 2), np.nan)])
+    return a
 
 
-PLAY_AIM_MIN_JUMPS = 20   # jumps one play needs for its overaim / underaim to mean something
+@dataclass
+class _Along:
+    scale: float    # the mean click along the movement as a share of the distance: + overaim, - underaim
+    t: float
+    n: int
+    mean_px: float  # the mean click along the movement, osu! px (+ past the centre, - short of it)
+
+
+def _along(d: np.ndarray, along: np.ndarray) -> _Along | None:
+    """Where the hits sit on the aim meter turned along the movement, on average."""
+    if len(along) < 10:
+        return None
+    mean, se = along.mean(), along.std(ddof=1) / math.sqrt(len(along))
+    return _Along(float(along.sum() / max(d.sum(), 1e-9)), float(mean / se) if se > 0 else 0.0, len(along),
+                  float(mean))
+
+
+PLAY_AIM_MIN_JUMPS = 20   # hits one play needs for its overaim / underaim to mean something
 
 
 def play_aim(samples: list[Sample]) -> dict | None:
-    """Overaim (+) or underaim (-) in one play, as a share of the jump distance (the same fit as the advice)."""
+    """Overaim (+) or underaim (-) in one play, as a share of the distance (the aim meter along the movement,
+    as the advice reads it)."""
     a = jump_clicks(samples)
-    if len(a) < PLAY_AIM_MIN_JUMPS:
-        return {"jumps": len(a), "scale": None, "min_jumps": PLAY_AIM_MIN_JUMPS, "ok": MIN_SCALE}
-    fit = _fit(a[:, 0], a[:, 1])
-    return {"jumps": len(a), "scale": fit.slope if fit else None, "t": fit.t if fit else None,
-            "min_jumps": PLAY_AIM_MIN_JUMPS, "ok": MIN_SCALE}
+    a = a[a[:, 10] == 0]
+    out = {"jumps": len(a), "scale": None, "min_jumps": PLAY_AIM_MIN_JUMPS, "ok": MIN_SCALE, "t_min": T_MIN}
+    m = _along(a[:, 0], a[:, 1]) if len(a) >= PLAY_AIM_MIN_JUMPS else None
+    if m:
+        out.update(scale=m.scale, t=m.t, mean_px=m.mean_px)
+    return out
 
 
 def _pct(x: float) -> str:
     return f"{abs(x) * 100:.0f}%"
 
 
-def _scale_advice(k: float, kx: float | None, ky: float | None, setup: Setup) -> str:
+def _scale_advice(k: float, setup: Setup) -> str:
     """What to change so that the cursor travels 1/(1+k) as far for the same hand movement."""
+    sens = f"{'lower' if k > 0 else 'raise'} sens ~{_pct(k / (1 + k))}"
     if setup.device == "mouse":
-        change = "lower" if k > 0 else "raise"
-        tip = f"{change} your sensitivity by about {_pct(k / (1 + k))}"
-        if setup.sens:
-            tip += f" (in-game sens {setup.sens:g} -> {setup.sens / (1 + k):.2f})"
-        return tip + "."
+        return f"Sens {setup.sens:g} -> {setup.sens / (1 + k):.2f}." if setup.sens else sens[0].upper() + sens[1:] + "."
     area = "increase" if k > 0 else "decrease"
     if setup.device == "tablet" and setup.area_w and setup.area_h:
-        w = setup.area_w * (1 + (kx if kx is not None else k))
-        h = setup.area_h * (1 + (ky if ky is not None else k))
-        return (f"{area} your tablet area: {setup.area_w:g}x{setup.area_h:g}mm -> {w:.1f}x{h:.1f}mm"
-                + ("" if kx is not None else " (same aspect ratio)") + ".")
-    tip = f"tablet: {area} your area by about {_pct(k)}; mouse: {'lower' if k > 0 else 'raise'} your sensitivity by about {_pct(k / (1 + k))}"
-    return tip + " (tell me your setup with `config` for exact numbers)."
+        return (f"Area {setup.area_w:g}x{setup.area_h:g} -> {setup.area_w * (1 + k):.1f}x{setup.area_h * (1 + k):.1f}mm "
+                f"(same ratio).")
+    return f"Tablet: {area} area ~{_pct(k)}; mouse: {sens}. Set your setup for exact numbers."
 
 
 def _aim_rules(a: np.ndarray, setup: Setup) -> list[Insight]:
@@ -133,30 +154,29 @@ def _aim_rules(a: np.ndarray, setup: Setup) -> list[Insight]:
     d, along, perp, mx, my, ex, ey, speed, radius, _, missed = (a[:, i] for i in range(11))   # played_at unused
     out = []
 
-    # the mean overaim (+) or underaim (-) as a share of the jump distance: a negative one means a smaller area
-    # (or a lower sensitivity), a positive one a larger area, whenever it reaches the MIN_SCALE setting
-    k = _fit(d, along).slope
+    # where the hits sit on the aim meter turned along the movement: below the centre (underaim) means a smaller
+    # area (or a higher sensitivity), above it (overaim) a larger area, whenever it reaches the MIN_SCALE setting
+    hit = missed == 0
+    m = _along(d[hit], along[hit])
+    if m is None:
+        return out
+    k = m.scale
     pct = lambda x: f"{'+' if x > 0 else '-'}{abs(x) * 100:.1f}%"
-    if abs(k) >= MIN_SCALE and k != 0:
-        fx, fy = _fit(mx, ex), _fit(my, ey)
-        per_axis = (fx and fy and abs(fx.slope - fy.slope) >= MIN_AXIS_DIFF
-                    and abs(fx.t) >= T_MIN and abs(fy.t) >= T_MIN)
-        kx, ky = (fx.slope, fy.slope) if per_axis else (None, None)
-        word = "overaim" if k > 0 else "underaim"
-        axis_txt = f" Horizontally {pct(fx.slope)}, vertically {pct(fy.slope)}." if per_axis else ""
+    meter = f"hits {abs(m.mean_px):.1f}px {'past' if k > 0 else 'short of'} the centre ({pct(k)}, {m.n} hits)"
+    what = "sensitivity" if setup.device == "mouse" else "area"
+    if abs(k) >= MIN_SCALE and abs(m.t) >= T_MIN:
         out.append(Insight(
-            f"You {word} by ~{abs(k) * 100:.1f}%: adjust your {'sensitivity' if setup.device == 'mouse' else 'area'}",
-            f"On {len(a)} jumps, the longer the jump the further {'past' if k > 0 else 'short of'} the circle you "
-            f"click: {pct(k)} of the distance on average.{axis_txt} "
-            + _scale_advice(k, kx, ky, setup)[0].upper() + _scale_advice(k, kx, ky, setup)[1:],
-            # misses on the side the scaling pushes you to, half of them blamed on it
+            f"{'Overaim' if k > 0 else 'Underaim'} {abs(k) * 100:.1f}%: {'larger' if k > 0 else 'smaller'} area"
+            if what == "area" else f"{'Overaim' if k > 0 else 'Underaim'} {abs(k) * 100:.1f}%: "
+            f"{'lower' if k > 0 else 'higher'} sensitivity",
+            f"Aim meter along the movement: {meter}. " + _scale_advice(k, setup),
+            # misses on the side you lean to, half of them blamed on it
             impact=0.5 * float(((missed > 0) & (np.sign(along) == np.sign(k))).sum()),
-            evidence={"scale": k, "n": len(a)}))
+            evidence={"scale": k, "n": m.n}))
     else:
-        out.append(Insight(
-            f"Your {'sensitivity' if setup.device == 'mouse' else 'area'} looks right",
-            f"On {len(a)} jumps your error scales by {pct(k)} of the distance: below the {MIN_SCALE * 100:g}% "
-            f"worth changing settings for.", 0, kind="info", evidence={"scale_ok": k}))
+        why = f"under the {MIN_SCALE * 100:g}% cutoff" if abs(k) < MIN_SCALE else "too inconsistent to tell"
+        out.append(Insight(f"{what.capitalize()} looks right", f"{meter[0].upper()}{meter[1:]}: {why}.", 0,
+                           kind="info", evidence={"scale_ok": k}))
 
     rot = _fit(d, perp)
     angle = math.degrees(math.atan(rot.slope))
@@ -164,11 +184,9 @@ def _aim_rules(a: np.ndarray, setup: Setup) -> list[Insight]:
         direction = "clockwise" if angle > 0 else "anticlockwise"
         current = f" (now {setup.area_rotation:g} deg)" if setup.device == "tablet" and setup.area_rotation is not None else ""
         out.append(Insight(
-            f"Your aim is rotated {abs(angle):.1f} deg {direction}",
-            f"Your movements come out turned {direction} compared with the jumps. "
-            + (f"Turn your mousepad (or grip) about {abs(angle):.1f} deg {direction}." if setup.device == "mouse" else
-               f"Rotate your tablet area about {abs(angle):.1f} deg {direction}{current}; check in the driver's "
-               f"preview that the area turns that way."),
+            f"Aim rotated {abs(angle):.1f} deg {direction}",
+            f"Turn your mouse grip {abs(angle):.1f} deg {direction}." if setup.device == "mouse" else
+            f"Rotate the area {abs(angle):.1f} deg {direction}{current}; check the direction in the driver's preview.",
             abs(angle) * 2, evidence={"rotation_deg": angle}))
 
     r = radius.mean()
@@ -183,50 +201,92 @@ def _aim_rules(a: np.ndarray, setup: Setup) -> list[Insight]:
     if shifts:
         out.append(Insight(
             "Your clicks are shifted",
-            f"On average you click {' and '.join(s[0] for s in shifts)} of the circle centre: "
-            + "; ".join(s[1] for s in shifts) + ". (A small shift is harmless; only change it if it bothers you.)",
+            f"{' and '.join(s[0] for s in shifts).capitalize()} of the centre: " + "; ".join(s[1] for s in shifts)
+            + " (only if it bothers you).",
             1, evidence={"mean_x": mean_x, "mean_y": mean_y}))
     return out
 
 
+def _side_change(k: float, x_side: bool, setup: Setup) -> str:
+    side = "width" if x_side else "height"
+    if not (setup.area_w and setup.area_h):
+        return f"{'Increase' if k > 0 else 'Decrease'} only the {side} ~{_pct(k)}."
+    w, h = (setup.area_w * (1 + k), setup.area_h) if x_side else (setup.area_w, setup.area_h * (1 + k))
+    return (f"Area {setup.area_w:g}x{setup.area_h:g} -> {w:.1f}x{h:.1f}mm "
+            f"(ratio {setup.area_w / setup.area_h:.2f} -> {w / h:.2f}).")
+
+
+def _edge_shoot(ex, ey, mx, my, nx, ny, x_edge: bool) -> tuple[_Along | None, _Along | None]:
+    """Hits of the notes near the left/right (x_edge) or top/bottom border, reached moving towards that border:
+    how far past (+) or short of (-) them on the border's axis, and on the other axis (shares of the move)."""
+    pos, size, margin = (nx, PLAYFIELD_W, EDGE_MARGIN_X) if x_edge else (ny, PLAYFIELD_H, EDGE_MARGIN_Y)
+    side = np.where(pos < margin, -1.0, np.where(pos > size - margin, 1.0, 0.0))
+    side[np.isnan(pos)] = 0.0
+    e, mv, e2, mv2 = (ex, mx, ey, my) if x_edge else (ey, my, ex, mx)
+    sel = (side != 0) & (mv * side > 0)
+    if sel.sum() < EDGE_MIN_HITS:
+        return None, None
+    near = _along(np.abs(mv[sel]), e[sel] * side[sel])
+    other = np.abs(mv2[sel]) >= 1
+    far = _along(np.abs(mv2[sel][other]), (e2[sel] * np.sign(mv2[sel]))[other])
+    return near, far
+
+
 def _aspect_rule(a: np.ndarray, setup: Setup) -> list[Insight]:
-    """Aspect ratio: horizontal jumps against vertical ones. When one axis misses clearly more, and on it the
-    player over- or undershoots, only that side of the area changes (a tablet; a mouse has no aspect ratio)."""
+    """Aspect ratio, from the plain aim meter (not turned with the movement): when the notes near the playfield's
+    edges are over- or undershot only on the axis of their edge, or the hits spread wider on one axis than on the
+    other, only that side of the area changes (a tablet; a mouse has no aspect ratio)."""
     if setup.device == "mouse":
         return []
-    d, along, mx, my, missed = a[:, 0], a[:, 1], a[:, 3], a[:, 4], a[:, 10]
-    horiz, vert = np.abs(mx) >= ASPECT_AXIS * np.abs(my), np.abs(my) >= ASPECT_AXIS * np.abs(mx)
-    if horiz.sum() < ASPECT_MIN_JUMPS or vert.sum() < ASPECT_MIN_JUMPS:
+    hit = a[:, 10] == 0
+    d, along, mx, my, ex, ey, nx, ny = (a[hit, i] for i in (0, 1, 3, 4, 5, 6, 12, 13))
+    shot = lambda m: m is not None and abs(m.scale) >= ASPECT_MIN_SCALE and abs(m.t) >= T_MIN
+    pct = lambda x: f"{'+' if x > 0 else '-'}{abs(x) * 100:.1f}%"
+
+    # notes near the edges: over/undershot on their edge's axis, not the same way on the other axis, and not the
+    # same way near the other axis's edges (that would be the whole area)
+    edge = {x: _edge_shoot(ex, ey, mx, my, nx, ny, x) for x in (True, False)}
+    for x_side in (True, False):
+        near, far = edge[x_side]
+        o_near = edge[not x_side][0]
+        if not shot(near) or shot(far) and np.sign(far.scale) == np.sign(near.scale):
+            continue
+        if shot(o_near) and np.sign(o_near.scale) == np.sign(near.scale):
+            continue
+        k, side = near.scale, "width" if x_side else "height"
+        where, axis, o_axis = ("left/right", "horizontal", "vertical") if x_side else ("top/bottom", "vertical", "horizontal")
+        other = f", {pct(far.scale)} on the {o_axis} axis" if far else ""
+        return [Insight(f"Area aspect ratio: {'more' if k > 0 else 'less'} {side}",
+                        f"Notes at the {where} edges: {'past' if k > 0 else 'short of'} them by {pct(k)} on the "
+                        f"{axis} axis{other} ({near.n} hits). " + _side_change(k, x_side, setup),
+                        0.5 * near.n * abs(k) / ASPECT_MIN_SCALE,
+                        evidence={"aspect": "horizontal" if x_side else "vertical", "scale": k, "edge": True})]
+
+    # the hits' spread on each axis of the plain meter
+    if hit.sum() < 2 * ASPECT_MIN_JUMPS:
         return []
-    mh, mv = missed[horiz].mean(), missed[vert].mean()
-    p = missed[horiz | vert].mean()
-    se = math.sqrt(p * (1 - p) * (1 / horiz.sum() + 1 / vert.sum())) if 0 < p < 1 else 0.0
-    if not se or abs(mh - mv) / se < T_MIN or max(mh, mv) < ASPECT_MIN_RATIO * max(min(mh, mv), 1e-9):
+    sx, sy = ex.std(ddof=1), ey.std(ddof=1)
+    if min(sx, sy) <= 0:
         return []
-    x_worse = mh > mv
-    sel = horiz if x_worse else vert
-    worse, better = (mh, mv) if x_worse else (mv, mh)
-    axis, side = ("horizontal", "width") if x_worse else ("vertical", "height")
-    fit = _fit(d[sel], along[sel])
-    head = (f"You miss {axis} jumps {worse / max(better, 1e-9):.1f}x as often as {'vertical' if x_worse else 'horizontal'} "
-            f"ones ({worse * 100:.1f}% against {better * 100:.1f}%, on {int(sel.sum())} and "
-            f"{int((vert if x_worse else horiz).sum())} jumps).")
-    impact = float((worse - better) * sel.sum())
-    if fit is None or abs(fit.slope) < ASPECT_MIN_SCALE or abs(fit.t) < T_MIN:
-        return [Insight(f"You miss more {axis} jumps", head + f" On them you don't clearly over- or undershoot, so the "
-                        f"area's {side} isn't the cause: train {axis} jumps.", impact,
-                        evidence={"aspect": axis, "miss_h": mh, "miss_v": mv})]
-    k = fit.slope
-    word = "overshoot" if k > 0 else "fall short of"
-    tip = f"{'increase' if k > 0 else 'decrease'} only the {side} of your area by about {_pct(k)}"
-    if setup.area_w and setup.area_h:
-        w, h = (setup.area_w * (1 + k), setup.area_h) if x_worse else (setup.area_w, setup.area_h * (1 + k))
-        tip = (f"{'increase' if k > 0 else 'decrease'} only the {side} of your area: {setup.area_w:g}x{setup.area_h:g}mm -> "
-               f"{w:.1f}x{h:.1f}mm (aspect ratio {setup.area_w / setup.area_h:.2f} -> {w / h:.2f})")
-    return [Insight(f"Adjust your area's aspect ratio: {'more' if k > 0 else 'less'} {side}",
-                    head + f" On them you {word} the circle by {abs(k) * 100:.1f}% of the distance: {tip}. "
-                    f"This replaces changing the whole area: the other side is fine.", impact,
-                    evidence={"aspect": axis, "scale": k, "miss_h": mh, "miss_v": mv})]
+    log_ratio, se = math.log(sx * sx / (sy * sy)), math.sqrt(4 / (len(ex) - 1))
+    if max(sx, sy) < ASPECT_MIN_SPREAD * min(sx, sy) or abs(log_ratio) / se < T_MIN:
+        return []
+    x_side = sx > sy
+    sel = (np.abs(mx) >= ASPECT_AXIS * np.abs(my)) if x_side else (np.abs(my) >= ASPECT_AXIS * np.abs(mx))
+    axis, side = ("horizontal", "width") if x_side else ("vertical", "height")
+    head = (f"Hits spread {max(sx, sy) / min(sx, sy):.2f}x wider {axis}ly ({max(sx, sy):.1f} vs {min(sx, sy):.1f}px, "
+            f"{len(ex)} hits)")
+    m = _along(d[sel], along[sel]) if sel.sum() >= ASPECT_MIN_JUMPS else None
+    if not shot(m):
+        return [Insight(f"Hits spread wider {axis}ly", head + f", but no clear over/undershoot on {axis} moves: "
+                        f"not the area, train {axis} jumps.", 1,
+                        evidence={"aspect": axis, "spread_x": sx, "spread_y": sy})]
+    k = m.scale
+    return [Insight(f"Area aspect ratio: {'more' if k > 0 else 'less'} {side}",
+                    head + f"; {axis} moves {'past' if k > 0 else 'short of'} the circle by {pct(k)} ({m.n} hits). "
+                    + _side_change(k, x_side, setup),
+                    0.5 * m.n * abs(k) / ASPECT_MIN_SCALE,
+                    evidence={"aspect": axis, "scale": k, "spread_x": sx, "spread_y": sy})]
 
 
 def _key_names(presses) -> str:
