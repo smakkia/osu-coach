@@ -209,6 +209,7 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .progress .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, var(--pink-deep), var(--pink)); border-radius: 6px; transition: width .3s; }
 .progress .bar.indet i { width: 35% !important; animation: indet 1.2s ease-in-out infinite; }
 @keyframes indet { from { left: -35%; } to { left: 100%; } }
+.job-prog:not(:empty) { margin-bottom: 16px; }
 .progress .lbl { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; color: var(--text-2); }
 
 .spinner { width: 18px; height: 18px; border-radius: 50%; border: 2.5px solid var(--pink-line); border-top-color: var(--pink); animation: spin .8s linear infinite; }
@@ -266,6 +267,7 @@ label.field .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
 .advice-item { padding: 12px 0; }
 .advice-item + .advice-item { border-top: 1px solid var(--border); }
 .advice-item p { margin: 4px 0 0; color: var(--text-2); font-size: 13.5px; }
+.advice-item .num { color: var(--pink-2); font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .card-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
 .card-head .ico { width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center; background: var(--pink-soft); flex: none; }
 .card-head .ico svg { width: 19px; height: 19px; fill: none; stroke: var(--pink-2); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
@@ -517,3 +519,10 @@ ul.also b { color: var(--text); font-weight: 600; }
 .strip-speed { top: calc(10px * var(--strip, 1)); transform: scale(var(--strip, 1)); transform-origin: top left; }   /* with the strip */
 .strip-speed .btn { width: 22px; height: 16px; padding: 0; border-radius: 4px; justify-content: center; font-family: var(--mono);
   font-size: 12px; line-height: 1; background: rgba(18, 13, 23, .7); }
+
+/* .osr files dragged over the window */
+.drop-overlay { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 16px;
+  background: rgba(10, 6, 14, .72); backdrop-filter: blur(3px); pointer-events: none; animation: pop .15s ease-out; }
+.drop-box { display: grid; justify-items: center; gap: 8px; padding: 34px 48px; border-radius: 16px; text-align: center;
+  background: var(--surface-3); border: 2px dashed var(--pink); box-shadow: var(--shadow); }
+.drop-box svg { width: 34px; height: 34px; color: var(--pink); }

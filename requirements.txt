@@ -1,2 +1,3 @@
 numpy==2.5.3
 pywebview==6.2.1
+rosu-pp-py==4.0.2

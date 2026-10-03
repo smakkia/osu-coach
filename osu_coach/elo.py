@@ -7,6 +7,8 @@ balanced player) passes as often as they pass those challenges on average (87% o
 hit...), and every CALIBRATION[skill][1] points multiply the difficulty by e. A player's rating in a skillset is then the level
 of challenge they pass that often: after every play it moves by K per challenge times (passed - expected), as in Elo.
 The scales are fixed, not fitted on each player: 1300 in streams means the same streams for everyone.
+A play's step also weighs the map's star rating against STAR_CENTRE: doing well on a map harder than that counts
+more, doing badly on it counts less (and the other way round on an easier map).
 """
 
 import json
@@ -20,12 +22,17 @@ import numpy as np
 from .locate import CACHE_DIR
 
 PLAYS_PATH = CACHE_DIR / "elo_plays.json"   # the challenges of every play judged so far, by replay file
-PLAYS_VERSION = "2"   # 2: alt only from 130 to 180 BPM, as on the Skills page
+PLAYS_VERSION = "4"   # 2: alt only from 130 to 180 BPM, as on the Skills page; 4: high AR above AR 10
 DAYS = 90
 WARMUP_DAYS = 30               # the plays of the month before the 90 days give the starting rating
 MIN_WARMUP_PLAYS = 10
 REFERENCE = 1200.0
+HIGH_AR = 10.0                 # the notes of plays above this effective AR are high AR challenges
 MAX_STEP = 60.0                # a single play moves a rating by at most this much
+STAR_CENTRE = 6.5              # the star rating where a play's step counts as it is
+STAR_WEIGHT = 0.25             # a good play's step x e^(0.25 d^1.5), a bad play's step / e^(0.25 d^1.5), d stars above it
+STAR_POWER = 1.5               # ...so the weight keeps growing faster the further the map is from the centre
+STAR_LINEAR = 8.0              # above this star rating the weight grows linearly, at the curve's slope there
 
 # skill: (label, pass rate at equal ratings: the reference player's own, K per challenge)
 SKILLS = {
@@ -36,7 +43,7 @@ SKILLS = {
     "flow": ("Flow aim", 0.979, 0.8),
     "sliders": ("Sliders", 0.938, 1.0),
     "stamina": ("Stamina", 0.582, 16.0),
-    "high_ar": ("High AR", 0.968, 0.6),
+    "high_ar": ("High AR", 0.981, 0.6),
     "reading": ("Reading", 0.919, 0.8),
     "accuracy": ("Accuracy", 0.911, 0.25),
 }
@@ -50,7 +57,7 @@ CALIBRATION = {
     "flow": (15.6837, 276.5),          # radii per second, 0.3-3 radii
     "sliders": (21.2904, 337.9),       # slider ball speed, radii per second
     "stamina": (1043.15, 400.0),       # notes in the play
-    "high_ar": (0.00198746, 799.1),    # 1 / approach time in ms, AR 9+
+    "high_ar": (0.00263203, 112.9),    # 1 / approach time in ms, above AR 10 (refitted on 2026-10-02)
     "reading": (6.6234, 43.7),         # notes on screen + 1, below AR 9
     "accuracy": (0.040681, 266.5),     # 1 / the 300 window in real ms
 }
@@ -95,10 +102,10 @@ def challenges(samples, rate: float, hit300: float) -> dict[str, list[tuple[floa
         if r.obj.kind == SLIDER and r.obj.span_duration > 0:
             slider = r.obj.path.length / f._radius / (r.obj.span_duration / s.rate / 1000)
             out["sliders"].append((slider, not s.missed and r.slider_break_kind is None))
-        if s.ar >= 9:
+        if s.ar > HIGH_AR + 0.01:   # AR 10 itself (HR, AR 10 maps) is not high AR
             preempt = 1200 - 150 * (s.ar - 5) if s.ar >= 5 else 1200 + 120 * (5 - s.ar)
             out["high_ar"].append((1 / preempt, not s.missed))
-        else:
+        elif s.ar < 9:
             out["reading"].append((f.visible + 1, not s.missed))
         if s.acc_eligible:
             out["accuracy"].append((rate / hit300, s.r.result == 300))
@@ -164,6 +171,21 @@ def _score(skill: str, rating: float, bins) -> tuple[float, int]:
     return diff, n
 
 
+def star_weight(stars: float | None, gain: bool) -> float:
+    """How much a play's step counts for its map's star rating against STAR_CENTRE: more for a gain on a harder
+    map, less for a loss on it; the opposite on an easier map."""
+    if not stars:
+        return 1.0
+    curve = lambda d: math.exp(STAR_WEIGHT * math.copysign(abs(d) ** STAR_POWER, d))
+    d, top = stars - STAR_CENTRE, STAR_LINEAR - STAR_CENTRE
+    if d <= top:
+        w = curve(d)   # no cap: MAX_STEP bounds the step
+    else:
+        slope = curve(top) * STAR_WEIGHT * STAR_POWER * top ** (STAR_POWER - 1)
+        w = curve(top) + slope * (d - top)
+    return w if gain else 1 / w
+
+
 def fit_rating(skill: str, plays: list[dict]) -> float | None:
     """The rating that expects exactly the challenges passed in these plays (the maximum likelihood one)."""
     bins = [b for p in plays for b in p["skills"].get(skill, [])]
@@ -208,7 +230,8 @@ def history(plays: list[dict], now: float | None = None, days: int = DAYS) -> di
                 if rating is None:
                     continue
             diff, n = _score(skill, rating, bins)
-            rating += max(-MAX_STEP, min(MAX_STEP, k * diff))
+            step = k * diff * star_weight(p.get("stars"), diff > 0)
+            rating += max(-MAX_STEP, min(MAX_STEP, step))
             i = day_of.get(time.strftime("%Y-%m-%d", time.localtime(p["time"])))
             if i is not None:
                 series[i] = rating

@@ -6,6 +6,7 @@ is found. Slow work (judging replays, searching the osu! site, downloading) runs
 polls, so the window never blocks. The server stops a while after the window stops pinging it.
 """
 
+import itertools
 import json
 import math
 import os
@@ -646,6 +647,42 @@ def combo_timeline(results, diff) -> list[list[int]]:
     return out
 
 
+def pp_timeline(results, map_path, mods: int, diff, combo: list[list[int]]) -> list[list[float]] | None:
+    """The pp so far as the play goes (rosu-pp, stable formula): [time, pp] after each object, up to the first
+    object not played (a fail). None when the map can't be calculated."""
+    from bisect import bisect_right
+
+    from .beatmap import CIRCLE
+    try:
+        import rosu_pp_py as rosu
+        bm = rosu.Beatmap(path=str(map_path))
+        if bm.is_suspicious():
+            return None
+        gradual = rosu.GradualPerformance(rosu.Difficulty(mods=mods, lazer=False), bm)
+    except Exception:
+        traceback.print_exc()
+        return None
+    combo_times = [c[0] for c in combo]
+    best = list(itertools.accumulate((c[1] for c in combo), max))
+    counts = {300: 0, 100: 0, 50: 0, 0: 0}
+    out, last = [], -math.inf
+    for r in sorted(results, key=lambda r: r.obj.index):
+        if r.result is None:
+            break
+        o = r.obj
+        counts[r.result] += 1
+        t = (r.hit_time if r.result else o.time + diff.hit50) if o.kind == CIRCLE else o.end_time
+        last = max(last, t)
+        i = bisect_right(combo_times, last) - 1
+        state = rosu.ScoreState(max_combo=best[i] if i >= 0 else 0, n300=counts[300], n100=counts[100],
+                                n50=counts[50], misses=counts[0])
+        attrs = gradual.next(state)
+        if attrs is None:
+            break
+        out.append([last, round(attrs.pp, 2)])
+    return out
+
+
 def viewer_data(beatmap, results, replay, diff, rate, samples) -> dict:
     """What the page needs to draw the play and list its mistakes: objects (as clicked: stacked, HR-flipped), their
     results and patterns, and the input."""
@@ -818,6 +855,7 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
         "training": training,
         "trends": skill_trends(habit_samples),
         "viewer": {**viewer_data(beatmap, results, replay, diff, rate, play_samples),
+                   "pp": pp_timeline(results, map_path, replay.mods, diff, combo_timeline(results, diff)),
                    "sounds": play_sounds(beatmap, results, map_path, diff.hit50),
                    "music": {"url": f"/audio/{replay.beatmap_md5}", "nightcore": bool(replay.mods & Mods.Nightcore)}
                    if map_audio(map_path) else None},
@@ -978,10 +1016,12 @@ OFFSET_OK_MS = 3           # a mean hit error within this is in time: no offset 
 def usual_timing(samples) -> dict | None:
     """How early or late the player usually is: the median of the mean hit error (real ms) of each recent play."""
     import numpy as np
+
+    from .analysis import timed_hit
     by_play: dict[int, list[float]] = {}
     for s in samples:
         r = s.r
-        if r.hit_error is not None and (r.head_result or r.result):
+        if timed_hit(r):
             by_play.setdefault(s.play, []).append(r.hit_error / s.rate)
     means = [float(np.mean(e)) for e in by_play.values() if len(e) >= OFFSET_MIN_HITS]
     if len(means) < 5:
@@ -994,7 +1034,8 @@ def offset_advice(s, results, rate: float, info) -> dict:
     """The local offset this play suggests for its map: osu!'s local offset moves the hit objects later when it goes
     up, so hitting late on average asks for it to go up by that much. When the player is off by about as much on
     every map, it's the universal offset that is wrong."""
-    hits = sum(1 for r in results if r.played and r.hit_error is not None and (r.head_result or r.result))
+    from .analysis import timed_hit
+    hits = sum(1 for r in results if r.played and timed_hit(r))
     usual = load_profile().get("habits") or {}
     usual = usual.get("timing")
     return {"hits": hits, "mean": s.mean_error, "rate": rate, "min_hits": OFFSET_MIN_HITS, "ok_ms": OFFSET_OK_MS,
@@ -1492,6 +1533,7 @@ def elo_plays(job: Job, settings: dict) -> list[dict]:
     not seen before; the rest comes from elo_plays.json."""
     from . import elo
     from .collect import PARALLEL_MIN
+    from .recommend import _star_key
     st = STATE.load(settings)
     since = time.time() - (elo.DAYS + elo.WARMUP_DAYS) * 86400
     entries = [e for e in st.replays.recent() if e.time >= since]
@@ -1516,8 +1558,14 @@ def elo_plays(job: Job, settings: dict) -> list[dict]:
             if pool:
                 pool.shutdown(wait=False, cancel_futures=True)
         elo.save_plays(known)
-    names = {e.name for e in entries}
-    return [p for name, p in known.items() if name in names]
+    # the map's star rating with the play's mods (osu!.db): the ratings weigh harder maps' plays more (elo.star_weight)
+    out = []
+    for e in entries:
+        if e.name in known:
+            m = st.infos.get(e.md5)
+            stars = (m.stars.get(_star_key(e.mods)) or m.stars.get(0)) if m else None
+            out.append({**known[e.name], "stars": stars})
+    return out
 
 
 def elo_history(job: Job, settings: dict) -> dict:

@@ -8,7 +8,7 @@
   const RES_COLOR = { 300: "#66ccff", 100: "#7ddc4f", 50: "#ffc93c", 0: "#ff4d6a" };
   const KEY_COLOR = { 0: "rgba(255,255,255,.9)", 1: "#ff66aa", 2: "#66ccff", 3: "#c77dff" };
   const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1];            // playback speeds of the slider's ticks
-  const TRAIL_MS = 200;                             // the skin's cursor trail: this much of real time before now
+  const TRAIL_MS = 160;                             // the skin's cursor trail: this much of real time before now
   const DRAWN_TRAIL_MS = 140;                       // the trail osu!coach draws itself (no skin cursor)
   const TRAIL_HZ = 120;                             // its sprites per second of real time (the replay has ~60 frames)
   const TRAIL_MIN_GAP = 1.5;                        // osu!px: closer to the last sprite drawn, skipped
@@ -198,6 +198,11 @@
         else if (o.k === "p") { o.jt = o.e; o.jx = [256, 192]; }
         else { o.jt = o.res === 0 || o.ht == null ? o.t + w50 : o.ht; o.jx = [o.x, o.y]; }
         o.jx = { x: o.jx[0], y: o.jx[1] };
+        // when a slider breaks the combo ("sb"): its head missed while the rest was held (when the combo drops, as
+        // gui.combo_timeline), or a tick or repeat dropped; a dropped end only misses its +1, it is no break
+        o.brk = o.k !== "s" || o.res == null ? null
+          : o.hr === 0 && o.res !== 0 ? o.t + w50
+          : o.sb != null && o.sk !== "end" ? o.sb : null;
       }
       this.times = objs.map(o => o.t);
       const f = d.frames;
@@ -244,10 +249,10 @@
       }
       this.aims.sort((a, b) => a.t - b.t);
       this.aimTimes = this.aims.map(a => a.t);
-      // running sums for the live UR (hit error of circles and slider heads, real time, counted as analysis.py does:
-      // a slider whose head was missed by timing still counts if the slider scored) and the aim UR (10 x the spread
+      // running sums for the live UR (hit error of circles and slider heads that were hit, real time, as
+      // analysis.timed_hit: a slider head clicked too early or late is left out) and the aim UR (10 x the spread
       // of the hits around their mean click point, osu! pixels): index i = the first i
-      const urHits = objs.filter(o => o.k !== "p" && o.ht != null && (o.hr || o.res))
+      const urHits = objs.filter(o => o.k !== "p" && o.ht != null && (o.k === "s" ? o.hr : o.res) > 0)
         .map(o => ({ t: o.ht, e: (o.ht - o.t) / d.rate })).sort((a, b) => a.t - b.t);
       this.urTimes = urHits.map(h => h.t);
       this.urSums = [[0, 0, 0]];
@@ -270,6 +275,9 @@
       this.start = Math.min(objs.length ? objs[0].t - 1500 : 0, f.t.length ? f.t[0] : 0);
       this.start = Math.max(this.start, objs.length ? objs[0].t - 3000 : 0);
       this.end = Math.max(objs.length ? objs[objs.length - 1].e + 1500 : 0, 1);
+      // a failed (or quit) play: objects left unplayed, the replay ends with its last input
+      if (objs.some(o => o.res == null) && f.t.length) this.end = Math.max(f.t[f.t.length - 1], this.start + 1);
+      this.ppTimes = d.pp ? d.pp.map(p => p[0]) : null;   // [time, pp so far] after each object (gui.pp_timeline)
     }
 
     build() {
@@ -793,8 +801,8 @@
       }
       // slider breaks
       for (const o of this.d.objects) {
-        if (o.sb == null || now < o.sb || now > o.sb + JUDGE_MS) continue;
-        const b = this.ballAt(o, o.sb), age = (now - o.sb) / JUDGE_MS;
+        if (o.brk == null || now < o.brk || now > o.brk + JUDGE_MS) continue;
+        const b = this.ballAt(o, o.brk), age = (now - o.brk) / JUDGE_MS;
         ctx.globalAlpha = 1 - age;
         ctx.fillStyle = "#ff8f5a"; ctx.font = `700 ${Math.round(r * .5)}px "Segoe UI", sans-serif`;
         ctx.textAlign = "center"; ctx.fillText("sb", b.x, b.y - r * 1.3);
@@ -942,6 +950,11 @@
       ctx.fillStyle = "#fff"; ctx.textAlign = "right"; ctx.textBaseline = "top";
       ctx.font = `700 ${20 * u}px "Cascadia Mono", Consolas, monospace`;
       ctx.fillText(`${(acc * 100).toFixed(2)}%`, cw - 18 * u, 52 * su);
+      if (this.ppTimes) {   // the pp so far, under the accuracy
+        const i = lowerBound(this.ppTimes, now + 1) - 1, pp = i >= 0 ? this.d.pp[i][1] : 0;
+        ctx.font = `700 ${15 * u}px "Cascadia Mono", Consolas, monospace`; ctx.fillStyle = "rgba(255,255,255,.8)";
+        ctx.fillText(`${Math.round(pp)}pp`, cw - 18 * u, 52 * su + 26 * u);
+      }
       if (this.comboTimes) {
         const i = lowerBound(this.comboTimes, now + 1) - 1, combo = i >= 0 ? this.d.combo[i][1] : 0;
         ctx.textAlign = "left"; ctx.textBaseline = "bottom";
@@ -1042,9 +1055,9 @@
             roundRect(ctx, xa, lanes.notes, xb - xa, noteLane, 3 * u); ctx.fill();
             ctx.globalAlpha = 1;
           }
-          if (o.sb != null && o.sb >= now - past && o.sb <= now) {   // where the slider was dropped
+          if (o.brk != null && o.brk >= now - past && o.brk <= now) {   // where the slider broke the combo
             ctx.fillStyle = "#ff8f5a";
-            ctx.fillRect(X(o.sb) - tick / 2, lanes.notes + inset, tick, noteLane - 2 * inset);
+            ctx.fillRect(X(o.brk) - tick / 2, lanes.notes + inset, tick, noteLane - 2 * inset);
           }
         }
         if (xh < x0 || xh > x1) continue;
@@ -1126,7 +1139,7 @@
         ctx.fillRect(X(s.start), 0, Math.max(2, X(s.end) - X(s.start)), h);
       }
       for (const o of this.d.objects) {
-        if (o.sb != null) { ctx.fillStyle = "#ff8f5a"; ctx.fillRect(X(o.sb) - 1, h * .55, 2, h * .45); }
+        if (o.brk != null) { ctx.fillStyle = "#ff8f5a"; ctx.fillRect(X(o.brk) - 1, h * .55, 2, h * .45); }
         if (o.res == null || o.res === 300) continue;
         ctx.fillStyle = RES_COLOR[o.res];
         const hh = o.res === 0 ? h : o.res === 50 ? h * .55 : h * .4;

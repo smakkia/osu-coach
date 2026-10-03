@@ -23,6 +23,14 @@ class Summary:
     spinners: int
 
 
+def timed_hit(r: ObjectResult) -> bool:
+    """A click that counts for the UR and the mean hit error: a circle or slider head that was hit. A slider whose
+    head was clicked too early or late is left out, even when the slider still scored."""
+    if r.hit_error is None:
+        return False
+    return bool(r.head_result if r.obj.kind == SLIDER else r.result)
+
+
 def summarize(results: list[ObjectResult], radius: float, rate: float = 1.0) -> Summary:
     counts = Counter()
     miss_reasons = Counter()
@@ -41,8 +49,7 @@ def summarize(results: list[ObjectResult], radius: float, rate: float = 1.0) -> 
         if r.obj.kind == SLIDER and r.slider_break_kind in ("tick", "repeat"):
             slider_breaks += 1
 
-    errors = np.array([r.hit_error for r in results
-                       if r.played and r.hit_error is not None and (r.head_result or r.result)], dtype=float)
+    errors = np.array([r.hit_error for r in results if r.played and timed_hit(r)], dtype=float)
     offsets = [r.aim_offset for r in results if r.played and r.aim_offset is not None]
     dist = np.array([math.hypot(*o) / radius for o in offsets]) if offsets else np.array([])
 
