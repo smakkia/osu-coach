@@ -1,0 +1,6 @@
+se un replay fallisce, il replay finisce nel momento in cui si fallisce (te ne accorgi perché non ci sono più input)
+
+aggiungi pp counter sotto l'accuracy
+
+per gli sliderend, non disegnare sb per uno sliderend mancato
+ per il calcolo dell'elo, considera anche lo star rating delle mappe: una performance buona su una mappa difficile conta più di una su una mappa facile, una performance cattiva su una mappa difficile conta meno rispetto a una su una mappa facile
