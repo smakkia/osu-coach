@@ -280,8 +280,6 @@
         c[{ 300: 0, 100: 1, 50: 2, 0: 3 }[o.res]]++;
         this.judgedCounts.push(c);
       }
-      this.sliderCache = new Map();   // sliders on screen, drawn once (sliderLayers)
-      this.frameNo = 0;
       // the hit error bar: circles and slider heads (coloured by the head's own judgement)
       this.hits = objs.filter(o => o.k !== "p" && o.ht != null && (o.k === "c" ? o.res : o.hr) > 0)
         .map(o => ({ t: o.ht, err: o.ht - o.t, res: o.k === "c" ? o.res : o.hr }))
@@ -610,7 +608,6 @@
       const objs = d.objects;
       const from = lowerBound(this.times, now - this.maxDur - 800);
       const to = lowerBound(this.times, now + pre + 1);
-      this.frameNo++;
       // objects: later ones underneath, so draw them first
       for (let n = to - 1; n >= from; n--) {
         const o = objs[n];
@@ -646,7 +643,6 @@
           ctx.globalAlpha = 1;
         }
       }
-      for (const [o, layers] of this.sliderCache) if (layers.frame !== this.frameNo) this.sliderCache.delete(o);   // off screen
       this.drawJudgements(ctx, now, r);
       this.drawClicks(ctx, now);
       if (!(this.cursorPath && this.hideCursor)) this.drawCursor(ctx, now);
@@ -691,76 +687,14 @@
       ctx.globalAlpha = 1;
     }
 
-    /** A slider's body and border, drawn once for the playfield's current scale and colours (a resize, full screen,
-        another skin or the border turning red at a break draw them again) on canvases the size of the slider. Tracing
-        the path a dozen times on canvases as big as the viewer, for every slider at every frame, was the viewer's
-        heaviest work; now a frame only copies them. draw() drops the ones off screen.
-        As osu! draws a legacy skin's slider: an opaque border, and inside it a body (laid 70% opaque) from the track
-        colour (the skin's, else the combo colour), a little darker at the edge to lighter in the middle. */
-    sliderLayers(ctx, o, broken) {
-      const r = this.d.radius, path = o.path, ini = this.skin?.ini || {};
-      const m = ctx.getTransform(), cw = ctx.canvas.width, ch = ctx.canvas.height;
-      const track = ini.slider_track || toRgb(o.color), bc = ini.slider_border;
-      const borderColor = broken ? "#ff4d6a" : bc ? `rgb(${bc[0]},${bc[1]},${bc[2]})` : "#fff";
-      const key = `${m.a},${m.e},${m.f},${cw},${ch},${track},${borderColor}`;
-      let layers = this.sliderCache.get(o);
-      if (layers?.key !== key) {
-        // the canvas pixels the slider covers (its path, the border's half width and room for the antialiasing)
-        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-        for (const [x, y] of path) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
-        const s = m.a;
-        const left = Math.max(0, Math.floor(m.e + s * (x0 - r)) - 2), top = Math.max(0, Math.floor(m.f + s * (y0 - r)) - 2);
-        const right = Math.min(cw, Math.ceil(m.e + s * (x1 + r)) + 2), bottom = Math.min(ch, Math.ceil(m.f + s * (y1 + r)) + 2);
-        layers = { key, x: left, y: top };
-        if (right > left && bottom > top) {
-          // traced on a canvas as big as the viewer's, with the playfield's transform (the antialiasing comes out the
-          // same as drawn straight on the viewer), then only the slider's pixels kept
-          const w = right - left, h = bottom - top;
-          const traced = () => {
-            const g = this.scratch(ctx, left, top, w, h);
-            g.beginPath();
-            g.moveTo(path[0][0], path[0][1]);
-            for (let i = 1; i < path.length; i++) g.lineTo(path[i][0], path[i][1]);
-            return g;
-          };
-          const kept = g => {
-            const c = document.createElement("canvas");
-            c.width = w; c.height = h;
-            c.getContext("2d").drawImage(g.canvas, left, top, w, h, 0, 0, w, h);
-            return c;
-          };
-          const inner = r * 2 * (1 - SLIDER_BORDER);
-          const edge = track.map(v => v / 1.1), middle = track.map(v => Math.min(255, v * 1.125 + 255 * .25));
-          const body = traced();
-          for (let i = 0; i < SLIDER_STEPS; i++) {
-            const k = i / (SLIDER_STEPS - 1);
-            body.strokeStyle = `rgb(${edge.map((v, j) => Math.round(v + (middle[j] - v) * k)).join(",")})`;
-            body.lineWidth = inner * (1 - k * .92);
-            body.stroke();
-          }
-          layers.body = kept(body);
-          const border = traced();
-          border.strokeStyle = borderColor;
-          border.lineWidth = r * 2; border.stroke();
-          border.globalCompositeOperation = "destination-out";
-          border.lineWidth = inner; border.stroke();
-          layers.border = kept(border);
-        }
-        this.sliderCache.set(o, layers);
-      }
-      layers.frame = this.frameNo;
-      return layers;
-    }
-
-    /** A canvas the size of the viewer's, with the playfield's transform and blank over the given pixels: where
-        sliderLayers traces a slider before keeping those pixels. */
-    scratch(ctx, left, top, w, h) {
-      const c = this.scratchCanvas ||= document.createElement("canvas");
+    /** A canvas the size of the viewer's, with the playfield's transform, cleared: the slider body is drawn there
+        opaque (so its overlapping strokes don't add up) and then laid on the playfield at once. */
+    layer(ctx, key) {
+      const c = this[key] ||= document.createElement("canvas");
       if (c.width !== ctx.canvas.width || c.height !== ctx.canvas.height) { c.width = ctx.canvas.width; c.height = ctx.canvas.height; }
       const g = c.getContext("2d");
-      g.globalCompositeOperation = "source-over";
       g.setTransform(1, 0, 0, 1, 0, 0);
-      g.clearRect(left, top, w, h);
+      g.clearRect(0, 0, c.width, c.height);
       g.setTransform(ctx.getTransform());
       g.lineJoin = "round"; g.lineCap = "round";
       return g;
@@ -768,13 +702,37 @@
 
     drawSlider(ctx, o, now, alpha) {
       const r = this.d.radius, path = o.path;
-      const layers = this.sliderLayers(ctx, o, o.sb != null && now >= o.sb);
+      const trace = g => {
+        g.beginPath();
+        g.moveTo(path[0][0], path[0][1]);
+        for (let i = 1; i < path.length; i++) g.lineTo(path[i][0], path[i][1]);
+      };
+      // as osu! draws a legacy skin's slider: an opaque border, and inside it a body 70% opaque, from the track colour
+      // (the skin's, else the combo colour) a little darker at the edge to lighter in the middle
+      const ini = this.skin?.ini || {};
+      const inner = r * 2 * (1 - SLIDER_BORDER);
+      const track = ini.slider_track || toRgb(o.color);
+      const edge = track.map(v => v / 1.1), middle = track.map(v => Math.min(255, v * 1.125 + 255 * .25));
+      const body = this.layer(ctx, "bodyLayer");
+      trace(body);
+      for (let i = 0; i < SLIDER_STEPS; i++) {
+        const k = i / (SLIDER_STEPS - 1);
+        body.strokeStyle = `rgb(${edge.map((v, j) => Math.round(v + (middle[j] - v) * k)).join(",")})`;
+        body.lineWidth = inner * (1 - k * .92);
+        body.stroke();
+      }
+      const border = this.layer(ctx, "borderLayer");
+      trace(border);
+      const bc = ini.slider_border;
+      border.strokeStyle = o.sb != null && now >= o.sb ? "#ff4d6a" : bc ? `rgb(${bc[0]},${bc[1]},${bc[2]})` : "#fff";
+      border.lineWidth = r * 2; border.stroke();
+      border.globalCompositeOperation = "destination-out";
+      border.lineWidth = inner; border.stroke();
+      border.globalCompositeOperation = "source-over";
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      if (layers.body) {   // none when the slider is off the canvas
-        ctx.globalAlpha = alpha * SLIDER_BODY_ALPHA; ctx.drawImage(layers.body, layers.x, layers.y);
-        ctx.globalAlpha = alpha; ctx.drawImage(layers.border, layers.x, layers.y);
-      }
+      ctx.globalAlpha = alpha * SLIDER_BODY_ALPHA; ctx.drawImage(body.canvas, 0, 0);
+      ctx.globalAlpha = alpha; ctx.drawImage(border.canvas, 0, 0);
       ctx.restore();
       ctx.save();
       ctx.globalAlpha = alpha;
@@ -1176,13 +1134,10 @@
       }
     }
 
-    /** The timeline under the playhead, drawn (at a resize) on a canvas of its own that each frame copies. */
     drawTimelineBase() {
-      const w = this.tlCanvas.width, h = this.tlCanvas.height, span = this.end - this.start;
-      const base = this.tlBase ||= document.createElement("canvas");
-      base.width = w; base.height = h;   // which clears it
-      const ctx = base.getContext("2d");
+      const c = this.tlCanvas, ctx = c.getContext("2d"), w = c.width, h = c.height, span = this.end - this.start;
       const X = t => (t - this.start) / span * w;
+      ctx.clearRect(0, 0, w, h);
       // note density
       const bins = Math.max(1, Math.floor(w / 3)), dens = new Array(bins).fill(0);
       for (const o of this.d.objects) dens[clamp(Math.floor((o.t - this.start) / span * bins), 0, bins - 1)]++;
@@ -1201,13 +1156,13 @@
         const hh = o.res === 0 ? h : o.res === 50 ? h * .55 : h * .4;
         ctx.fillRect(X(o.jt) - (o.res === 0 ? 1 : .5), h - hh, o.res === 0 ? 2 : 1, hh);
       }
+      this.tlBase = ctx.getImageData(0, 0, w, h);
     }
 
     drawPlayhead() {
       const c = this.tlCanvas, ctx = c.getContext("2d");
       if (!this.tlBase) return;
-      ctx.clearRect(0, 0, c.width, c.height);
-      ctx.drawImage(this.tlBase, 0, 0);   // a copy on the GPU (putImageData went through the CPU at every frame)
+      ctx.putImageData(this.tlBase, 0, 0);
       const x = (this.now - this.start) / (this.end - this.start) * c.width;
       if (this.loop) {
         const a = (this.loop[0] - this.start) / (this.end - this.start) * c.width, b = (this.loop[1] - this.start) / (this.end - this.start) * c.width;

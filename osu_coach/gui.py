@@ -1868,8 +1868,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_file(self, path: Path, ctype: str):
-        """A file, in parts when the browser asks (the audio element seeks with Range requests)."""
-        size = path.stat().st_size
+        """A file, in parts when the browser asks."""
+        def read(start, end):
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0 and (chunk := f.read(min(left, 1 << 16))):
+                    yield chunk
+                    left -= len(chunk)
+        self._send_ranges(path.stat().st_size, read, ctype)
+
+    def _send_ranges(self, size: int, read, ctype: str):
+        """size bytes, in parts when the browser asks (the audio element seeks with Range requests); read(start, end)
+        gives the bytes from start to end (inclusive) in chunks."""
         m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range") or "")
         if not m or not (m.group(1) or m.group(2)):
             self.send_response(200)
@@ -1891,15 +1902,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(end - start + 1))
         self.end_headers()
-        with open(path, "rb") as f:
-            f.seek(start)
-            left = end - start + 1
-            while left > 0:
-                chunk = f.read(min(left, 1 << 16))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                left -= len(chunk)
+        for chunk in read(start, end):
+            self.wfile.write(chunk)
 
     def _json(self, data, code: int = 200):
         self._send(code, json.dumps(clean(data)).encode("utf-8"), "application/json")
@@ -1926,7 +1930,16 @@ class Handler(BaseHTTPRequestHandler):
                 path = map_audio(map_path) if map_path else None
                 if path is None:
                     return self._send(404, b"not found", "text/plain")
+                song = None
+                if path.suffix.lower() == ".mp3":   # in an MP4, where the viewer's seeks land exactly (mp4audio.py)
+                    from . import mp4audio
+                    try:
+                        song = mp4audio.song(path)
+                    except Exception:
+                        traceback.print_exc()
                 try:
+                    if song:
+                        return self._send_ranges(song.size, song.read, "audio/mp4")
                     return self._send_file(path, STATIC_TYPES.get(path.suffix.lower(), "application/octet-stream"))
                 except (ConnectionError, OSError):
                     return   # the browser dropped the request (it does when seeking)

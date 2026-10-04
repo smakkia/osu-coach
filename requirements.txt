@@ -1,3 +1,6 @@
+# rosu-pp-py with osu!'s 2026-07-03 pp update, built from github.com/smakkia/rosu-pp-py-for-osu-coach (vendor/):
+# no official release has it yet. Back to the PyPI version once one does.
+--find-links vendor
 numpy==2.5.3
 pywebview==6.2.1
-rosu-pp-py==4.0.2
+rosu-pp-py==4.0.2+pp2026q2
