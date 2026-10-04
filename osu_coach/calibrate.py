@@ -163,7 +163,7 @@ def collect_jobs(dataset: Path, maps: MapFinder, log=print) -> tuple[list, Count
     for tier in tiers:
         for path in sorted(tier.rglob("*.osr")):
             try:
-                replay = parse_replay(path)
+                replay = parse_replay(path, frames=False)   # the header is enough to group it
             except Exception:
                 skipped["unreadable replay"] += 1
                 continue

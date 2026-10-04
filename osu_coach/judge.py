@@ -7,13 +7,15 @@ timing error, where the cursor was at the click, why an object was missed,
 where a slider broke.
 """
 
+import bisect
+import itertools
 import math
 from dataclasses import dataclass, field
 
 from .beatmap import CIRCLE, SLIDER, SPINNER, Beatmap, HitObject
 from .difficulty import HITTABLE_RANGE, Difficulty, f32
 from .mods import Mods
-from .replay import Replay
+from .replay import M1, M2, Replay
 
 NOTELOCK_TOLERANCE = 3  # Tolerance2B in danser
 FOLLOW_RADIUS_SCALE = 2.4
@@ -88,6 +90,8 @@ class _SliderState:
     missed: int = 0
     done: bool = False
     last_acceptable: bool | None = None  # button check at the previous frame
+    # the score points' times but the last one, in order (the end, judged early, can come before the last tick)
+    times: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -114,11 +118,12 @@ class _Sim:
         self.results = [ObjectResult(o) for o in beatmap.objects]
         self.queue_pos = 0
         self.processed: list[ObjectResult] = []
+        self.finished_any = False   # an object was finished since processed was last cleaned (update_queue)
         self.slider: dict[int, _SliderState] = {}
         self.spinner: dict[int, _SpinnerState] = {}
         for r in self.results:
             if r.obj.kind == SLIDER:
-                self.slider[r.obj.index] = _SliderState()
+                self.slider[r.obj.index] = _SliderState(times=[p.time for p in r.obj.score_points[:-1]])
             elif r.obj.kind == SPINNER:
                 duration = r.obj.end_time - r.obj.time
                 self.spinner[r.obj.index] = _SpinnerState(
@@ -140,17 +145,14 @@ class _Sim:
             return st.done and st.head_done
         return self.is_hit(r)
 
-    def can_be_hit(self, time: int, r: ObjectResult) -> str:
-        """Stable notelock rules: 'click', 'shake' or 'ignored'."""
+    def can_be_hit(self, time: int, r: ObjectResult, idx: int) -> str:
+        """Stable notelock rules: 'click', 'shake' or 'ignored'. `idx`: r's place in processed."""
         if r.obj.kind == CIRCLE:
-            idx = self.processed.index(r)
             if idx > 0:
                 prev = self.processed[idx - 1]
                 if prev.obj.stack > 0 and not self.is_hit(prev):
                     return "ignored"  # don't shake stacks
-        for g in self.processed:
-            if g is r:
-                break
+        for g in itertools.islice(self.processed, idx):
             if not self.is_hit(g) and g.obj.end_time + NOTELOCK_TOLERANCE < r.obj.time:
                 return "shake"
         if abs(time - r.obj.time) >= HITTABLE_RANGE:
@@ -176,7 +178,9 @@ class _Sim:
 
     # --- per-frame phases --------------------------------------------------
     def update_queue(self, time: int):
-        self.processed = [r for r in self.processed if not self.is_finished(r)]
+        if self.finished_any:   # objects only finish in click and post
+            self.processed = [r for r in self.processed if not self.is_finished(r)]
+            self.finished_any = False
         while (self.queue_pos < len(self.results)
                and self.results[self.queue_pos].obj.time - self.diff.preempt <= time):
             self.processed.append(self.results[self.queue_pos])
@@ -201,7 +205,7 @@ class _Sim:
 
     def click(self):
         inp = self.inp
-        for r in list(self.processed):
+        for idx, r in enumerate(self.processed):
             if not (inp.left_cond_e or inp.right_cond_e):
                 return
             obj = r.obj
@@ -214,7 +218,7 @@ class _Sim:
 
             px, py = obj.position
             in_range = math.hypot(inp.x - px, inp.y - py) <= self.diff.radius
-            action = self.can_be_hit(inp.time, r)
+            action = self.can_be_hit(inp.time, r, idx)
 
             if in_range:
                 if action == "click":
@@ -237,6 +241,7 @@ class _Sim:
                         st.head_result = r.head_result = grade
                         if grade == 0:
                             r.miss_reason = "timing"
+                    self.finished_any = True
                 else:
                     inp.left_cond_e = inp.right_cond_e = False
                     if action == "shake":
@@ -308,8 +313,9 @@ class _Sim:
             st.slide_start = time
 
         points = obj.score_points
-        if point is None:
-            passed = sum(1 for p in points if p.time <= time)
+        if point is None and st.scored + st.missed < len(points):
+            # the points due by now: the ordered ones by binary search, and the end, which can come before them
+            passed = bisect.bisect_right(st.times, time) + (points[-1].time <= time)
             if st.scored + st.missed < passed:
                 point = points[st.scored + st.missed]
         if point is not None:
@@ -386,6 +392,7 @@ class _Sim:
                 if r.result is None and t > obj.time + self.diff.hit50:
                     r.result = 0
                     r.miss_reason = _miss_reason(r)
+                    self.finished_any = True
             elif obj.kind == SLIDER:
                 st = self.slider[obj.index]
                 if not st.head_done and t > obj.time + self.diff.hit50:
@@ -393,12 +400,14 @@ class _Sim:
                     st.head_done = True
                     st.head_result = r.head_result = 0
                     r.miss_reason = _miss_reason(r)
+                    self.finished_any = True
                 if t >= obj.end_time and not st.done:
                     scored = st.scored + (1 if st.head_result else 0)
                     rate = scored / (len(obj.score_points) + 1)
                     r.result = 300 if rate == 1 else 100 if rate >= 0.5 else 50 if rate > 0 else 0
                     r.ticks_total, r.ticks_hit = len(obj.score_points), st.scored
                     st.done = True
+                    self.finished_any = True
             else:
                 sp = self.spinner[obj.index]
                 if t >= obj.end_time and not sp.done:
@@ -413,6 +422,7 @@ class _Sim:
                         r.result = 0
                     r.spins, r.spins_required = spins, req
                     sp.done = True
+                    self.finished_any = True
 
     def finish(self):
         """Objects never resolved before the last frame were not played (fail/quit)."""
@@ -435,12 +445,13 @@ def judge(replay: Replay, beatmap: Beatmap) -> tuple[list[ObjectResult], Difficu
     sim = _Sim(beatmap, diff, replay.mods)
 
     for frame in replay.frames:
+        left, right = bool(frame.keys & M1), bool(frame.keys & M2)
         sim.update_queue(frame.time)
-        sim.update_buttons(frame.time, frame.x, frame.y, frame.left, frame.right)
+        sim.update_buttons(frame.time, frame.x, frame.y, left, right)
         sim.click()
         sim.normal()
         sim.post()
-        sim.end_frame(frame.left, frame.right)
+        sim.end_frame(left, right)
 
     sim.finish()
     return sim.results, diff

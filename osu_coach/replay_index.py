@@ -6,6 +6,7 @@ each map, and only reads files that are new or changed since the last run.
 """
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -98,10 +99,14 @@ class ReplayIndex:
 
     def _update(self):
         seen, changed = set(), False
-        for p in self.folder.glob("*.osr"):
-            seen.add(p.name)
-            st = p.stat()
-            old = self.entries.get(p.name)
+        try:   # os.scandir: each replay's size and time come with the folder's listing, no stat per file
+            files = [e for e in os.scandir(self.folder) if e.name.lower().endswith(".osr") and e.is_file()]
+        except OSError:
+            files = []
+        for e in files:
+            seen.add(e.name)
+            st = e.stat()
+            old = self.entries.get(e.name)
             if (old and old.mtime == st.st_mtime and old.size == st.st_size
                     and (old.ar is not None or old.mode != 0 or not self._retry_missing)):
                 continue
@@ -109,17 +114,17 @@ class ReplayIndex:
                 entry = old  # known replay whose map was missing: try the map again
             else:
                 try:
-                    r = parse_replay(p, frames=False)
+                    r = parse_replay(Path(e.path), frames=False)
                 except Exception:
                     continue
-                entry = ReplayEntry(p.name, st.st_mtime, st.st_size, r.mode, r.player, r.mods, r.beatmap_md5,
+                entry = ReplayEntry(e.name, st.st_mtime, st.st_size, r.mode, r.player, r.mods, r.beatmap_md5,
                                     (r.timestamp - TICKS_AT_UNIX_EPOCH) / 1e7)
             if entry.mode == 0:
                 d = self._map_difficulty(entry.md5)
                 if d is not None:
                     cs, ar, od = d
                     entry.ar = effective_ar(Difficulty.from_map(cs, ar, od, entry.mods), clock_rate(entry.mods))
-            self.entries[p.name] = entry
+            self.entries[e.name] = entry
             changed = True
         for name in set(self.entries) - seen:  # deleted replays
             del self.entries[name]

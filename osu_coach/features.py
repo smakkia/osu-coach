@@ -267,6 +267,14 @@ def _mark_fingers(feats: list[ObjectFeatures], single_alternate_ms: float):
         prev = f
 
 
+def _pstdev(values) -> float:
+    """Population standard deviation in floats: statistics.pstdev computes it exactly, with fractions, and took a
+    third of the time of judging a play."""
+    xs = list(values)
+    mean = math.fsum(xs) / len(xs)
+    return math.sqrt(math.fsum((x - mean) ** 2 for x in xs) / len(xs))
+
+
 def _mark_reading(feats: list[ObjectFeatures], diff: Difficulty):
     """What the player has to read at each hit: the upcoming notes already on screen."""
     starts = [f.r.obj.time for f in feats]
@@ -288,11 +296,11 @@ def _mark_reading(feats: list[ObjectFeatures], diff: Difficulty):
         f.overlap_share = overlaps / (len(window) - 1)
         gaps = [o.gap_ms for o in window[1:] if 0 < o.gap_ms < BREAK_GAP_MS]
         if len(gaps) >= 2:
-            f.rhythm_var = statistics.pstdev(math.log2(g) for g in gaps)
+            f.rhythm_var = _pstdev(math.log2(g) for g in gaps)
         angles = [o.angle for o in window[1:] if o.angle is not None]
         if len(angles) >= 2:
-            f.angle_var = statistics.pstdev(angles) / 180
+            f.angle_var = _pstdev(angles) / 180
         spacing = [o.distance_radii for o in window[1:]]
         mean = statistics.fmean(spacing)
         if len(spacing) >= 2 and mean > 0:
-            f.spacing_var = statistics.pstdev(spacing) / mean
+            f.spacing_var = _pstdev(spacing) / mean

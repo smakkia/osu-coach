@@ -8,8 +8,10 @@ is sure enough (the thresholds below, chosen on maps held out of the training): 
 finger control are one family: without the .osu they can't be told apart), else the main kind, else nothing.
 """
 
+import json
 import pickle
 import re
+import threading
 
 import numpy as np
 
@@ -199,28 +201,51 @@ def real_guess(a: dict) -> dict:
             "aim control": maptypes.has_aim_control(a), "p_type": 1.0, "p_main": 1.0, "p_aim": 1.0}
 
 
+_LOWCONF_LOCK = threading.Lock()   # searches can run at once
+_lowconf: list = []                 # [(mtime, size), labels]: LOWCONF as last read or written
+
+
+def _labels() -> dict:
+    """LOWCONF's labels, read again only when the file changed (the training writes it too)."""
+    try:
+        st = LOWCONF.stat()
+    except OSError:
+        return {}
+    if not _lowconf or _lowconf[0] != (st.st_mtime_ns, st.st_size):
+        try:
+            _lowconf[:] = [(st.st_mtime_ns, st.st_size), json.loads(LOWCONF.read_text())]
+        except (OSError, ValueError):
+            return {}
+    return _lowconf[1]
+
+
 def remember(results) -> int:
     """Keep the real types of maps downloaded from the site: (MapInfo, mods, analysis) with analyses from
     maptypes.types(), NM and DT only. They go to the training's labels and replace the maps' guesses, so
-    guess, search and recommend show the real type from then on. Returns how many were new."""
-    import json
+    guess, search and recommend show the real type from then on. Returns how many were new. The labels file
+    (which grows with every map downloaded) is read once and written only when something changed."""
     from .recommend import load_predicted
-    try:
-        done = json.loads(LOWCONF.read_text())
-    except (OSError, ValueError):
-        done = {}
     guessed = {}
     new = 0
-    for m, mods, a in results:
-        name = {0: "NM", 64: "DT"}.get(mods)
-        if not a or not name or m.beatmap_id <= 0:
-            continue
-        entry = done.setdefault(str(m.beatmap_id), {"stars": m.stars.get(0, 0.0)})
-        entry.pop("error", None)
-        new += name not in entry
-        entry[name] = a
-        guessed[f"{m.beatmap_id}:{name}"] = real_guess(a)
-    LOWCONF.parent.mkdir(parents=True, exist_ok=True)
-    LOWCONF.write_text(json.dumps(done))
-    load_predicted().update(guessed)
+    with _LOWCONF_LOCK:
+        done = _labels()
+        changed = False
+        for m, mods, a in results:
+            name = {0: "NM", 64: "DT"}.get(mods)
+            if not a or not name or m.beatmap_id <= 0:
+                continue
+            entry = done.setdefault(str(m.beatmap_id), {"stars": m.stars.get(0, 0.0)})
+            if "error" in entry or entry.get(name) != a:
+                entry.pop("error", None)
+                new += name not in entry
+                entry[name] = a
+                changed = True
+            guessed[f"{m.beatmap_id}:{name}"] = real_guess(a)
+        if changed:
+            LOWCONF.parent.mkdir(parents=True, exist_ok=True)
+            LOWCONF.write_text(json.dumps(done))
+            st = LOWCONF.stat()
+            _lowconf[:] = [(st.st_mtime_ns, st.st_size), done]
+    if guessed:
+        load_predicted().update(guessed)
     return new

@@ -47,6 +47,26 @@ def _read_osu_db(path: Path) -> dict[str, str]:
     return {m.md5: m.path for m in read_osu_db(path)}
 
 
+def _osu_files(songs: Path):
+    """(path relative to Songs, mtime, size) of every .osu file in it. os.scandir lists the folders with each
+    file's size and time (on Windows), where a stat per file took ten times as long."""
+    stack = [""]
+    while stack:
+        rel = stack.pop()
+        try:
+            it = os.scandir(songs / rel if rel else songs)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                sub = os.path.join(rel, e.name) if rel else e.name
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(sub)
+                elif e.name.lower().endswith(".osu"):
+                    st = e.stat()
+                    yield sub, st.st_mtime, st.st_size
+
+
 class BeatmapIndex:
     """Resolves beatmap MD5s to .osu paths, via osu!.db with a hashing fallback."""
 
@@ -57,6 +77,11 @@ class BeatmapIndex:
         self._scan_cache_path = CACHE_DIR / "beatmap_hashes.json"
         self._scan: dict[str, dict] | None = None  # rel path -> {mtime, size, md5}
         self._by_md5: dict[str, str] | None = None
+
+    def use_db(self, paths: dict[str, str]):
+        """MD5 -> 'folder/file.osu' of osu!.db as the caller read it (the window reads osu!.db for itself, and again
+        when osu! saves it): not read a second time here, and up to date."""
+        self._db = paths
 
     def _from_db(self, md5: str) -> Path | None:
         if self._db is None:
@@ -72,22 +97,32 @@ class BeatmapIndex:
         return None
 
     def _rescan(self) -> None:
-        """Hash .osu files not seen before (osu!.db is only written when the game exits)."""
+        """Hash .osu files not seen before (osu!.db is only written when the game exits), forget deleted ones."""
         if self._scan is None:
             try:
                 self._scan = json.loads(self._scan_cache_path.read_text())
             except (OSError, ValueError):
                 self._scan = {}
-        for p in self.songs.rglob("*.osu"):
-            rel = str(p.relative_to(self.songs))
-            st = p.stat()
+        if not self.songs.is_dir():   # Songs out of reach (a drive unplugged?): keep what is known
+            return
+        seen, changed = set(), False
+        for rel, mtime, size in _osu_files(self.songs):
+            seen.add(rel)
             cached = self._scan.get(rel)
-            if cached and cached["mtime"] == st.st_mtime and cached["size"] == st.st_size:
+            if cached and cached["mtime"] == mtime and cached["size"] == size:
                 continue
-            self._scan[rel] = {"mtime": st.st_mtime, "size": st.st_size,
-                               "md5": hashlib.md5(p.read_bytes()).hexdigest()}
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        self._scan_cache_path.write_text(json.dumps(self._scan))
+            try:
+                md5 = hashlib.md5((self.songs / rel).read_bytes()).hexdigest()
+            except OSError:
+                continue
+            self._scan[rel] = {"mtime": mtime, "size": size, "md5": md5}
+            changed = True
+        for rel in set(self._scan) - seen:
+            del self._scan[rel]
+            changed = True
+        if changed:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self._scan_cache_path.write_text(json.dumps(self._scan))
 
     def find(self, md5: str) -> Path | None:
         found = self._from_db(md5)

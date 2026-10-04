@@ -129,3 +129,12 @@ class SliderPath:
     def position_at(self, progress: float) -> Point:
         """Position at progress in [0, 1] along the (length-limited) path."""
         return self.position_at_distance(min(1.0, max(0.0, progress)) * self.length)
+
+
+class PathLength:
+    """A slider path once its play is judged and its features read (collect.slim): only its length, all that the
+    statistics over many plays use of it."""
+    __slots__ = ("length",)
+
+    def __init__(self, length: float):
+        self.length = length

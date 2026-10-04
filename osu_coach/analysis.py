@@ -31,6 +31,16 @@ def timed_hit(r: ObjectResult) -> bool:
     return bool(r.head_result if r.obj.kind == SLIDER else r.result)
 
 
+def combo_breaks(results) -> dict:
+    """Why a play with no miss isn't a full combo. sb: combo breaks that aren't misses, slider heads missed on
+    sliders that still scored and dropped ticks or repeats (the "Break" rows of the replay page's mistake list);
+    se: dropped slider ends, which keep the combo but miss its +1, so the play isn't a full combo either."""
+    sliders = [r for r in results if r.played and r.obj.kind == SLIDER]
+    return {"sb": sum(1 for r in sliders if r.head_result == 0 and r.result != 0
+                      or r.head_result != 0 and r.slider_break_kind in ("tick", "repeat")),
+            "se": sum(1 for r in sliders if r.head_result != 0 and r.slider_break_kind == "end")}
+
+
 def summarize(results: list[ObjectResult], radius: float, rate: float = 1.0) -> Summary:
     counts = Counter()
     miss_reasons = Counter()

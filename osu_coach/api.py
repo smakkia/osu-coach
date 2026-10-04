@@ -7,6 +7,7 @@ players' best scores, and .osu files (no audio) to analyse maps that aren't in S
 
 import hashlib
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -18,6 +19,9 @@ from .locate import CACHE_DIR
 
 API_PATH = CACHE_DIR / "api.json"
 RESPONSE_CACHE = CACHE_DIR / "api_cache"
+# players' best scores, apart: retraining the map type guesser learns from them (typepred.api_index) and fetching them
+# again takes minutes, so Clear cache leaves them
+SCORES_CACHE = RESPONSE_CACHE / "scores"
 OSU_FILES = CACHE_DIR / "osu_files"
 BASE = "https://osu.ppy.sh/api/v2"
 TOKEN_URL = "https://osu.ppy.sh/oauth/token"
@@ -44,6 +48,67 @@ def load_credentials() -> dict:
 def save_credentials(data: dict):
     API_PATH.parent.mkdir(parents=True, exist_ok=True)
     API_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _url(path: str, params: dict | None) -> str:
+    query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None}, doseq=True)
+    return f"{BASE}{path}" + (f"?{query}" if query else "")
+
+
+def _cache_path(path: str, url: str) -> Path:
+    """Where an answer is cached: players' best scores in SCORES_CACHE, the rest in RESPONSE_CACHE."""
+    folder = SCORES_CACHE if path.endswith("/scores/best") else RESPONSE_CACHE
+    return folder / (hashlib.md5(url.encode()).hexdigest() + ".json")
+
+
+def _best_scores_request(user_id: int, limit: int = 100) -> tuple[str, dict]:
+    return f"/users/{user_id}/scores/best", {"mode": "osu", "limit": limit}
+
+
+_SCORES_MOVED = []
+
+
+def _move_training_scores():
+    """Best scores cached before they had a folder of their own (SCORES_CACHE) lie among the rest: the ones of the
+    players sampled for training (profiles.json) are moved there, found by the name their URL gives them. Once."""
+    if _SCORES_MOVED:
+        return
+    _SCORES_MOVED.append(True)
+    from .profiles import load
+    for p in (load() or {}).get("players", []):
+        path, params = _best_scores_request(int(p["id"]))
+        new = _cache_path(path, _url(path, params))
+        old = RESPONSE_CACHE / new.name
+        if old.exists():
+            new.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(old, new)
+
+
+def cache_files() -> list[tuple[Path, int]]:
+    """The online search cache, with each file's size: the API's answers (searches, leaderboards, beatmaps) and the
+    downloaded .osu files; not the players' best scores (SCORES_CACHE)."""
+    _move_training_scores()
+    out = []
+    for folder in (RESPONSE_CACHE, OSU_FILES):
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        out += [(Path(e.path), e.stat().st_size) for e in entries if e.is_file()]
+    return out
+
+
+def clear_cache() -> tuple[int, int]:
+    """Delete the online search cache: (files, bytes) freed. A file that can't be deleted (in use) is left."""
+    files = freed = 0
+    for path, size in cache_files():
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        files += 1
+        freed += size
+    return files, freed
 
 
 class OsuApi:
@@ -102,9 +167,12 @@ class OsuApi:
         return self.creds["token"]
 
     def get(self, path: str, params: dict | None = None, ttl: float = CACHE_TTL_S) -> dict:
-        query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None}, doseq=True)
-        url = f"{BASE}{path}" + (f"?{query}" if query else "")
-        cache = RESPONSE_CACHE / (hashlib.md5(url.encode()).hexdigest() + ".json")
+        url = _url(path, params)
+        cache = _cache_path(path, url)
+        old = RESPONSE_CACHE / cache.name
+        if ttl and cache.parent == SCORES_CACHE and not cache.exists() and old.exists():
+            cache.parent.mkdir(parents=True, exist_ok=True)   # cached before best scores had a folder of their own
+            os.replace(old, cache)
         if ttl and cache.exists() and time.time() - cache.stat().st_mtime < ttl:
             return json.loads(cache.read_text(encoding="utf-8"))
         req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT,
@@ -112,7 +180,7 @@ class OsuApi:
                                                    "x-api-version": "20240529"})
         data = json.loads(self._request(req))
         if ttl:
-            RESPONSE_CACHE.mkdir(parents=True, exist_ok=True)
+            cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(data), encoding="utf-8")
         return data
 
@@ -127,7 +195,7 @@ class OsuApi:
         return self.get(f"/beatmaps/{beatmap_id}/scores", {"mode": "osu", "limit": 50}).get("scores", [])
 
     def best_scores(self, user_id: int, limit: int = 100) -> list[dict]:
-        return self.get(f"/users/{user_id}/scores/best", {"mode": "osu", "limit": limit})
+        return self.get(*_best_scores_request(user_id, limit))
 
     def osu_file(self, beatmap_id: int) -> Path:
         """The .osu of a beatmap (no audio), downloaded once."""

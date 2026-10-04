@@ -17,7 +17,7 @@ pipeline as the ones in Songs: content, purity, difficulty for the player.
 from collections import Counter
 from dataclasses import dataclass
 
-from .api import OSU_FILES, ApiError, OsuApi
+from .api import OSU_FILES, ApiError, OsuApi, OsuFiles
 from .mapdb import MapInfo
 from .mods import Mods
 
@@ -185,14 +185,19 @@ def discover(api: OsuApi, keys: list[str], local_maps: list[MapInfo], band, tap_
         progress("left out by the guessed map type", dropped, dropped)
     out = []
     todo = list(chosen.values())
-    for n, f in enumerate(todo, 1):
-        try:
-            f.info.path = str(api.osu_file(f.info.beatmap_id))
-        except ApiError:
-            continue
-        out.append((f.info, f.mods))
-        if progress and n % 25 == 0:
-            progress("downloading .osu", n, len(todo))
+    files = OsuFiles(api)    # from the mirrors, several at once (osu.ppy.sh, one a second, is the last resort)
+    try:
+        pending = [files.submit(f.info.beatmap_id, f.info.md5) for f in todo]
+        for n, (f, fut) in enumerate(zip(todo, pending), 1):
+            try:
+                f.info.path = str(fut.result())
+            except (ApiError, OSError):
+                continue
+            out.append((f.info, f.mods))
+            if progress and n % 25 == 0:
+                progress("downloading .osu", n, len(todo))
+    finally:
+        files.close()
     return out
 
 

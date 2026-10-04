@@ -4,6 +4,7 @@ References: the .osu format wiki page, danser-go (beatmap/objects, stackleniency
 and lazer's OsuBeatmapProcessor for the stacking algorithm.
 """
 
+import bisect
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,18 +106,18 @@ class Beatmap:
     slider_tick_rate: float = 1.0
     timing_points: list[TimingPoint] = field(default_factory=list)
     objects: list[HitObject] = field(default_factory=list)
+    _timing_times: list[float] = field(default_factory=list, repr=False)
 
     @property
     def display_name(self) -> str:
         return f"{self.artist} - {self.title} [{self.difficulty_name}]"
 
     def timing_at(self, time: float) -> TimingPoint:
-        chosen = self.timing_points[0]
-        for tp in self.timing_points:
-            if tp.time > time:
-                break
-            chosen = tp
-        return chosen
+        """The last timing point at or before `time` (the first one before the map starts). A binary search: maps
+        with thousands of SV points asked this for every slider and every note."""
+        if len(self._timing_times) != len(self.timing_points):
+            self._timing_times = [tp.time for tp in self.timing_points]
+        return self.timing_points[max(bisect.bisect_right(self._timing_times, time) - 1, 0)]
 
     def apply_mods(self, mods: int) -> Difficulty:
         """Compute mod-adjusted difficulty and stack every object accordingly."""

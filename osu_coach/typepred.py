@@ -44,8 +44,9 @@ def song_key(artist: str, title: str) -> str:
 
 def api_index():
     """From cached API top plays: per beatmap id its metadata, and the scores set on it."""
+    from .api import RESPONSE_CACHE, SCORES_CACHE
     meta, scores = {}, defaultdict(list)
-    for f in (CACHE_DIR / "api_cache").glob("*"):
+    for f in [*SCORES_CACHE.glob("*.json"), *RESPONSE_CACHE.glob("*.json")]:   # best scores: older ones lie with the rest
         try:
             body = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):

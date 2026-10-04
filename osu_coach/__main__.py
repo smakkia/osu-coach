@@ -332,7 +332,9 @@ def cmd_recommend(args):
     from .locate import songs_dir
     from .mapdb import read_osu_db
     osu_dir = _osu_dir(args)
+    maps = read_osu_db(osu_dir / "osu!.db")
     index = BeatmapIndex(osu_dir)
+    index.use_db({m.md5: m.path for m in maps})   # read once
     replays = ReplayIndex(osu_dir, index)
     try:
         mod_sets = rc.parse_mods(args.mods)
@@ -342,7 +344,6 @@ def cmd_recommend(args):
     if model is None or not model.usual_rate or not model.stream_runs:
         model = _fit_player_model(osu_dir, index, replays, args)[0]
     targets = _choose_skills(model, args)
-    maps = read_osu_db(osu_dir / "osu!.db")
     infos = {m.md5: m for m in maps}
     owner_plays = replays.recent(args.player)
     ranges = _choose_ranges(args, rc.star_band(infos, [(e.md5, e.mods) for e in owner_plays[:args.last]]))

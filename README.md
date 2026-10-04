@@ -48,7 +48,8 @@ Open **osu!coach** from the shortcut. The window has these sections:
 - **Beatmap search**: find maps by name, skillset, stars, AR, CS, OD, BPM and length, in your Songs folder or on the
   osu! site; tick **Recommended for me** for maps a step above your level in the skillsets you pick. Click a map to
   open its page, or download it (then press F5 in osu!'s song select).
-- **Settings**: everything from the setup wizard, the search defaults and how sensitive the advice is.
+- **Settings**: everything from the setup wizard, the search defaults and how sensitive the advice is; **Clear cache**
+  frees the space taken by what searching the osu! site downloaded.
 
 Tips:
 - The more plays, the better: the profile and the skills need about 100 recent plays to be reliable.

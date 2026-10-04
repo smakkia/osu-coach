@@ -20,8 +20,10 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import asdict, is_dataclass
+from functools import cached_property
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -210,6 +212,7 @@ class Job:
         self.partial = None          # results so far (search)
         self.cancel = threading.Event()
         self.started = time.time()
+        self.finished: float | None = None
 
     def step(self, label: str, done: int = 0, total: int = 0):
         self.check()
@@ -226,6 +229,7 @@ class Job:
 
 
 JOBS: dict[str, Job] = {}
+JOB_KEEP_S = 120     # a finished job is kept this long, for the page to read its result (an analysis holds megabytes)
 
 
 def wait_for(job: Job, fut):
@@ -240,6 +244,9 @@ def wait_for(job: Job, fut):
 
 
 def start_job(kind: str, work) -> Job:
+    now = time.time()
+    for old in [j for j in JOBS.values() if j.finished and now - j.finished > JOB_KEEP_S]:
+        JOBS.pop(old.id, None)
     job = Job(kind)
     JOBS[job.id] = job
 
@@ -254,6 +261,8 @@ def start_job(kind: str, work) -> Job:
         except Exception as e:   # shown in the window instead of killing the server
             job.status, job.error = "error", f"{type(e).__name__}: {e}"
             traceback.print_exc()
+        finally:
+            job.finished = time.time()
     threading.Thread(target=run, daemon=True).start()
     return job
 
@@ -281,8 +290,8 @@ class State:
             if force or self.osu_dir != osu_dir or self.replays is None:
                 self.osu_dir = osu_dir
                 self.index = BeatmapIndex(osu_dir)
+                self._read_db()                       # first: the replay index looks maps up in it
                 self.replays = ReplayIndex(osu_dir, self.index)
-                self._read_db()
             elif self._db_mtime() != self.db_mtime:     # osu! saved it (it does when it closes): new maps
                 self._read_db()
             return self
@@ -298,6 +307,7 @@ class State:
         self.db_mtime = self._db_mtime()
         self.maps = read_osu_db(self.osu_dir / "osu!.db")
         self.infos = {m.md5: m for m in self.maps}
+        self.index.use_db({m.md5: m.path for m in self.maps})   # the maps' index reads it no more
 
     def songs_maps(self) -> list:
         """The maps in Songs: osu!.db's, and those downloaded by osu!coach that osu! hasn't put in it yet."""
@@ -347,17 +357,6 @@ def save_combo_breaks(counts: dict[str, dict]):
                 cache[key].update(n)
         REPLAY_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
         REPLAY_STATS_PATH.write_text(json.dumps(cache), encoding="utf-8")
-
-
-def combo_breaks(results) -> dict:
-    """Why a play with no miss isn't a full combo. sb: combo breaks that aren't misses, slider heads missed on
-    sliders that still scored and dropped ticks or repeats (the "Break" rows of the replay page's mistake list);
-    se: dropped slider ends, which keep the combo but miss its +1, so the play isn't a full combo either."""
-    from .beatmap import SLIDER
-    sliders = [r for r in results if r.played and r.obj.kind == SLIDER]
-    return {"sb": sum(1 for r in sliders if r.head_result == 0 and r.result != 0
-                      or r.head_result != 0 and r.slider_break_kind in ("tick", "repeat")),
-            "se": sum(1 for r in sliders if r.head_result != 0 and r.slider_break_kind == "end")}
 
 
 def replay_rows(settings: dict) -> dict:
@@ -474,33 +473,48 @@ def replay_path(replay_id: str) -> Path:
 
 
 def count_combo_breaks(job: Job, settings: dict, ids: list[str]) -> dict:
-    """Slider breaks and ends of replays with no miss that aren't a full combo, for the replay list: judged one by one,
-    each count shown (job.partial) and saved as it comes."""
-    from .beatmap import parse_beatmap
-    from .judge import judge
-    from .replay import parse_replay
+    """Slider breaks and ends of replays with no miss that aren't a full combo, for the replay list: judged in the
+    worker processes, each count shown as it comes (job.partial) and saved a few at a time."""
+    from .collect import combo_breaks_job
+    from .workers import imap
     st = STATE.load(settings)
     job.partial = {}
-    for n, replay_id in enumerate(ids):
-        job.step("Counting slider breaks", n, len(ids))
+    todo = []
+    for replay_id in ids:
         try:
-            replay = parse_replay(replay_path(replay_id))
-            map_path = st.index.find(replay.beatmap_md5)
-            if map_path is None or replay.mode != 0 or replay.mods & (128 | 8192):
-                continue
-            results, _ = judge(replay, parse_beatmap(map_path))
-        except Exception:   # a replay or map that can't be read: no count
+            path = replay_path(replay_id)
+        except UserError:
             continue
-        job.partial[replay_id] = combo_breaks(results)
-        save_combo_breaks({replay_id: job.partial[replay_id]})
+        h = read_header(path)
+        if h is None or h["mode"] != 0 or h["mods"] & (128 | 8192):
+            continue
+        map_path = st.index.find(h["md5"])
+        if map_path is not None:
+            todo.append((replay_id, (str(path), str(map_path))))
+    job.step("Counting slider breaks", 0, len(todo))
+    unsaved = {}
+    try:
+        with closing(imap(combo_breaks_job, [a for _, a in todo])) as results:
+            for n, ((replay_id, _), counts) in enumerate(zip(todo, results), 1):
+                job.step("Counting slider breaks", n, len(todo))
+                if counts is None:   # a replay or map that can't be read: no count
+                    continue
+                job.partial[replay_id] = unsaved[replay_id] = counts
+                if len(unsaved) >= 25:    # the whole replay list file is written each time
+                    save_combo_breaks(unsaved)
+                    unsaved = {}
+    finally:
+        if unsaved:
+            save_combo_breaks(unsaved)   # Stop keeps what was counted
     return job.partial
 
 
 # --- judging many plays, with progress ----------------------------------------------------------------------
 
 def gather(job: Job, label: str, last: int, player: str | None = None, select=None):
-    """Samples of the `last` most recent plays (as __main__._collect_samples), judged in parallel."""
-    from .collect import PARALLEL_MIN, _job
+    """Samples of the `last` most recent plays (as __main__._collect_samples): the plays judged before from the
+    cache, the others judged in parallel."""
+    from .collect import judged
     st = STATE
     jobs, times = [], []
     for entry in st.replays.recent(player, select):
@@ -512,11 +526,7 @@ def gather(job: Job, label: str, last: int, player: str | None = None, select=No
             times.append(entry.time)
     samples, taps, used = [], [], 0
     job.step(label, 0, len(jobs))
-    if not jobs:
-        return samples, taps, used
-    pool = ProcessPoolExecutor() if len(jobs) >= PARALLEL_MIN else None
-    try:
-        results = pool.map(_job, jobs, chunksize=2) if pool else map(_job, jobs)
+    with closing(judged(jobs)) as results:      # Stop (job.step) cancels the plays not started
         for n, result in enumerate(results, 1):
             job.step(label, n, len(jobs))
             if result is None:
@@ -528,19 +538,55 @@ def gather(job: Job, label: str, last: int, player: str | None = None, select=No
             samples += play_samples
             taps.append(play_taps)
             used += 1
-    finally:
-        if pool:
-            pool.shutdown(wait=False, cancel_futures=True)
     return samples, taps, used
 
 
-def habits_for(job: Job, settings: dict, player: str | None):
-    """Samples of the recent plays for the bad habits, kept while no new replay appears."""
+class Habits:
+    """The recent plays the bad habits come from, and what every analysis reads of them, each computed once."""
+
+    def __init__(self, samples: list, taps: list, used: int):
+        self.samples, self.taps, self.used = samples, taps, used
+
+    @cached_property
+    def insights(self) -> list:
+        from .advice import build_insights
+        return build_insights(self.samples) if self.samples else []
+
+    @cached_property
+    def measured(self) -> dict | None:
+        """What the area and key advice read from the plays (setup_advice.measure)."""
+        from .setup_advice import measure
+        return measure(self.samples, self.taps) if self.samples else None
+
+    @cached_property
+    def model(self):
+        """The player's recent form per pattern (the context episodes compare a play with it)."""
+        from .advice import ExpectedModel
+        return ExpectedModel(self.samples) if self.samples else None
+
+    @cached_property
+    def normal_ar_model(self):
+        """The recent form at AR 10 or below (the high AR episode compares a play above it with it)."""
+        from .advice import HIGH_AR, ExpectedModel
+        normal = [x for x in self.samples if x.ar <= HIGH_AR]
+        return ExpectedModel(normal) if len(normal) >= 1000 else None
+
+    @cached_property
+    def category_trends(self) -> list[dict]:
+        return trends(self.samples)
+
+    @cached_property
+    def skillset_trends(self) -> list[dict]:
+        return skill_trends(self.samples)
+
+
+def habits_for(job: Job, settings: dict, player: str | None) -> Habits:
+    """The recent plays for the bad habits, kept while no new replay appears."""
     n = int(settings["habit_plays"])
     recent = STATE.replays.recent(player)
     key = (player or "", n, recent[0].time if recent else 0)
     if key not in STATE.habits_cache:
-        STATE.habits_cache = {key: gather(job, "Bad habits from your recent plays", n, player)}
+        STATE.habits_cache = {key: Habits(*gather(job, "Bad habits from your recent plays", n, player))}
     return STATE.habits_cache[key]
 
 
@@ -746,8 +792,8 @@ def play_sounds(beatmap, results, map_path, miss_window: float) -> list:
 
 
 def analyze(job: Job, settings: dict, replay_id: str) -> dict:
-    from .advice import HIGH_AR, ExpectedModel, build_insights, effective_ar, samples_from_play
-    from .analysis import summarize
+    from .advice import effective_ar, samples_from_play
+    from .analysis import combo_breaks, summarize
     from .beatmap import parse_beatmap
     from .coach import prioritize
     from .explain import explain_play, timestamp
@@ -784,24 +830,22 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
     play_taps = tap_stats(replay.frames, results, {f.r.obj.index for f in feats if f.pattern in RUN_PATTERNS})
     setup = load_setup()
 
-    habit_samples, habit_taps, used = habits_for(job, settings, replay.player)
+    habits = habits_for(job, settings, replay.player)
+    habit_samples, used = habits.samples, habits.used
     job.step("Looking for mistakes")
     since, keys_since = setup_since()
-    from .setup_advice import measure as setup_measure, play_aim
-    habit_measured = setup_measure(habit_samples, habit_taps) if habit_samples else None
+    from .setup_advice import play_aim
+    habit_measured = habits.measured
     setup_found, area_msg = (area_gate(advise_setup(habit_measured, setup, since, keys_since), since, habit_measured)
                              if habit_measured else ([], ""))
     setup_found, keys_msg = keys_gate(setup_found, keys_since, habit_measured) if habit_measured else (setup_found, "")
-    insights = build_insights(habit_samples) + setup_found if habit_samples else []
-    model = ExpectedModel(habit_samples) if habit_samples else None
-    normal_ar = [x for x in habit_samples if x.ar <= HIGH_AR]
-    normal_ar_model = ExpectedModel(normal_ar) if len(normal_ar) >= 1000 else None
-    episodes = explain_play(play_samples, replay.frames, diff.radius, model, normal_ar_model, play_taps)
+    insights = habits.insights + setup_found if habit_samples else []
+    episodes = explain_play(play_samples, replay.frames, diff.radius, habits.model, habits.normal_ar_model, play_taps)
     priorities = prioritize(episodes, insights, play_samples, habit_samples)
 
     info = st.infos.get(replay.beatmap_md5)
     c = s.counts
-    trend = trends(habit_samples)
+    trend = habits.category_trends
     worse = {t["category"]: t for t in trend}
     training = []
     for p in priorities:
@@ -853,7 +897,7 @@ def analyze(job: Job, settings: dict, replay_id: str) -> dict:
                   "play_aim": play_aim(play_samples)},
         "setup_desc": setup.describe(),
         "training": training,
-        "trends": skill_trends(habit_samples),
+        "trends": habits.skillset_trends,
         "viewer": {**viewer_data(beatmap, results, replay, diff, rate, play_samples),
                    "pp": pp_timeline(results, map_path, replay.mods, diff, combo_timeline(results, diff)),
                    "sounds": play_sounds(beatmap, results, map_path, diff.hit50),
@@ -1036,8 +1080,10 @@ def offset_advice(s, results, rate: float, info) -> dict:
     every map, it's the universal offset that is wrong."""
     from .analysis import timed_hit
     hits = sum(1 for r in results if r.played and timed_hit(r))
-    usual = load_profile().get("habits") or {}
-    usual = usual.get("timing")
+    try:   # the usual timing the last profile measured (usual_timing): only that, not the whole profile
+        usual = json.loads(PROFILE_PATH.read_text(encoding="utf-8")).get("timing")
+    except (OSError, ValueError, AttributeError):
+        usual = None
     return {"hits": hits, "mean": s.mean_error, "rate": rate, "min_hits": OFFSET_MIN_HITS, "ok_ms": OFFSET_OK_MS,
             "current": info.local_offset if info else None, "usual": usual}
 
@@ -1532,8 +1578,8 @@ def elo_plays(job: Job, settings: dict) -> list[dict]:
     """The challenges of the owner's plays of the last 90 days and the month before (elo.py), judging only the plays
     not seen before; the rest comes from elo_plays.json."""
     from . import elo
-    from .collect import PARALLEL_MIN
     from .recommend import _star_key
+    from .workers import imap
     st = STATE.load(settings)
     since = time.time() - (elo.DAYS + elo.WARMUP_DAYS) * 86400
     entries = [e for e in st.replays.recent() if e.time >= since]
@@ -1546,17 +1592,12 @@ def elo_plays(job: Job, settings: dict) -> list[dict]:
                 todo.append((e, (str(st.replays.path(e)), str(map_path))))
     job.step("Reading your plays for the ratings", 0, len(todo))
     if todo:
-        pool = ProcessPoolExecutor() if len(todo) >= PARALLEL_MIN else None
-        try:
-            results = pool.map(elo.play_job, [a for _, a in todo], chunksize=2) if pool else map(elo.play_job, [a for _, a in todo])
+        with closing(imap(elo.play_job, [a for _, a in todo])) as results:
             for n, ((e, _), res) in enumerate(zip(todo, results), 1):
                 job.step("Reading your plays for the ratings", n, len(todo))
                 known[e.name] = {"time": e.time, "skills": res or {}}
                 if n % 50 == 0:
                     elo.save_plays(known)
-        finally:
-            if pool:
-                pool.shutdown(wait=False, cancel_futures=True)
         elo.save_plays(known)
     # the map's star rating with the play's mods (osu!.db): the ratings weigh harder maps' plays more (elo.star_weight)
     out = []
@@ -1749,6 +1790,23 @@ def api_test() -> dict:
         return {"ok": False, "message": str(e)}
 
 
+def cache_status() -> dict:
+    """The online search cache: files and bytes (api.cache_files)."""
+    from . import api
+    files = api.cache_files()
+    return {"files": len(files), "bytes": sum(size for _, size in files)}
+
+
+def cache_clear() -> dict:
+    """Settings' Clear cache. Not while a search runs: it reads the .osu files it downloads from the cache, and one
+    deleted under it would be saved as a map with no type."""
+    from . import api
+    if any(j.kind == "search" and j.status == "running" for j in list(JOBS.values())):
+        raise UserError("A search is running: wait for it to finish (or stop it), then clear the cache.")
+    files, freed = api.clear_cache()
+    return {"files": files, "bytes": freed, "left": cache_status()}
+
+
 def setup_get() -> dict:
     from .setup import load_setup
     s = load_setup()
@@ -1924,6 +1982,8 @@ class Handler(BaseHTTPRequestHandler):
             return skin.describe(osu_dir_of(settings), settings["viewer"]["skin"])
         if route == "elo":
             return {"elo": load_elo()}
+        if route == "cache":
+            return cache_status()
         if route.startswith("job/"):
             job = JOBS.get(route[4:])
             if not job:
@@ -1969,6 +2029,8 @@ class Handler(BaseHTTPRequestHandler):
             return api_save(body)
         if route == "api/test":
             return api_test()
+        if route == "cache/clear":
+            return cache_clear()
         if route == "open":
             target = str(body.get("url") or "")
             if target.startswith(("https://osu.ppy.sh/", "https://opentabletdriver.net/", RELEASES_URL)):

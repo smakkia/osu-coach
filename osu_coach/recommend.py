@@ -19,7 +19,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
-from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -62,7 +62,7 @@ SKILL_SHARE = {"jump": "jump", "stream": "stream", "alt": "alt", "finger control
                "tech": "tech sliders"}
 ONLINE_KEY = {"stream": "tap", "finger control": "finger"}   # online.discover's searches
 SAVE_EVERY = 500
-WORKERS = max((os.cpu_count() or 2) // 2, 1)   # leave the machine usable while profiling
+WORKERS = max((os.cpu_count() or 2) // 2, 1)   # maps read at once on long runs: leave the machine usable
 
 
 # --- content: from the map alone ------------------------------------------------------
@@ -315,6 +315,8 @@ def _run_cached(path, tag: str, jobs: list[tuple[str, tuple]], worker, progress=
     """Results by key, computing (in parallel) only the missing ones; saved as it goes (cachedb: only the keys
     asked for are read). `decode` turns a stored result into the one returned (None stays None: a map that
     couldn't be read)."""
+    from .workers import WORKERS as ALL_WORKERS, imap
+
     def dec(v):
         return decode(v) if decode and v is not None else v
     with Store(path, tag, legacy=path.with_suffix(".json")) as db:
@@ -322,8 +324,10 @@ def _run_cached(path, tag: str, jobs: list[tuple[str, tuple]], worker, progress=
         todo = list({k: a for k, a in jobs if k not in known}.items())
         if todo:
             new = {}
-            with ProcessPoolExecutor(max_workers=WORKERS) as pool:
-                for n, res in enumerate(pool.map(worker, [a for _, a in todo], chunksize=8), 1):
+            # a search's batch of ten maps all at once; long runs on half the cores
+            window = len(todo) if len(todo) <= ALL_WORKERS else WORKERS
+            with closing(imap(worker, [a for _, a in todo], window=window)) as results:
+                for n, res in enumerate(results, 1):
                     k = todo[n - 1][0]
                     new[k] = asdict(res) if hasattr(res, "__dataclass_fields__") else res
                     known[k] = dec(new[k])

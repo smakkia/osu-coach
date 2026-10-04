@@ -15,6 +15,7 @@ import bisect
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import numpy as np
 
@@ -63,7 +64,10 @@ class Sample:
     wrong_note: ObjectResult | None = None  # the other note this miss's click landed on
     hidden: bool = False      # played with HD: no approach circles to read
 
-    @property
+    # what comes from the judged object, which no longer changes, is computed once: the statistics over many plays
+    # read these millions of times
+
+    @cached_property
     def r(self) -> ObjectResult:
         return self.f.r
 
@@ -72,24 +76,24 @@ class Sample:
         """Identifies the run (stream, alt...) this object belongs to."""
         return self.play, self.r.obj.index - self.f.run_position
 
-    @property
+    @cached_property
     def missed(self) -> bool:
         """Missed the click itself (circle or slider head)."""
         return (self.r.head_result == 0) if self.r.obj.kind == SLIDER else (self.r.result == 0)
 
-    @property
+    @cached_property
     def error(self) -> float | None:
         """Hit error in real ms, only for successful clicks."""
         if self.r.hit_error is None or self.missed:
             return None
         return self.r.hit_error / self.rate
 
-    @property
+    @cached_property
     def acc_eligible(self) -> bool:
         """Circles hit for 300/100/50 (stable ignores slider head timing for score)."""
         return self.r.obj.kind == CIRCLE and self.r.result in (300, 100, 50)
 
-    @property
+    @cached_property
     def not_300(self) -> bool:
         return self.r.result in (100, 50)
 

@@ -152,6 +152,8 @@ function fmtDate(unix) {
   return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 }
 const fmtLen = s => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+/** Bytes as Windows shows them (1 KB = 1024 bytes). */
+const fmtSize = b => b >= 2 ** 30 ? `${(b / 2 ** 30).toFixed(1)} GB` : b >= 2 ** 20 ? `${Math.round(b / 2 ** 20)} MB` : `${Math.ceil(b / 2 ** 10)} KB`;
 
 function emptyState(ico, title, text, ...actions) {
   return h("div.empty", h("div.big-ico", { html: ICON[ico] }), h("h3", title), h("p", text), h("div.row", { style: { justifyContent: "center" } }, actions));
@@ -1734,6 +1736,19 @@ function buildSettings(root) {
     sc.tag_min_pct, 0, 60, 1, "%");
   const sReadAr = sensSlider("Reading up to AR", "A map can be tagged reading only at this effective AR or lower (with the mods it's played with). Lower AR also raises its reading score. Applied to the next search.",
     sc.reading_max_ar ?? 8.5, 7, 10, 0.1, "");
+  // the online search cache: its size, and a button that empties it at once (not with Save settings)
+  const cacheSize = h("span.small.muted", "…");
+  const showCache = c => { cacheSize.textContent = c.files ? `${fmtSize(c.bytes)} in ${c.files.toLocaleString("en")} files` : "empty"; };
+  api("cache").then(showCache).catch(() => { cacheSize.textContent = ""; });
+  const clearCache = h("button.btn", { onclick: async () => {
+    clearCache.disabled = true;
+    try {
+      const r = await api("cache/clear", {});
+      toast(r.files ? `Cache cleared: ${fmtSize(r.bytes)} freed.` : "The cache was already empty.");
+      showCache(r.left);
+    } catch (e) { toast(e.message, true); }
+    clearCache.disabled = false;
+  } }, "Clear cache");
   wrap.append(h("div.card",
     h("div.card-head", h("div.ico", { html: ICON.search }), h("h3", "Beatmap search")),
     h("div.small.muted", "Starting values of the search page (applied the next time the window opens)."),
@@ -1744,7 +1759,9 @@ function buildSettings(root) {
       h("label.field", "Number of maps shown", sLimit),
       h("label.field", h("span", "Search depth on the site ", h("span.hint", "(pages of 50 sets, one a second)")), sPages)),
     h("label.field", h("span", "Download mirror ", h("span.hint", "({set_id} = the beatmapset's number)")), sMirror),
-    sTag.el, sReadAr.el));
+    sTag.el, sReadAr.el,
+    h("div.row", h("span.muted", "Online search cache"), cacheSize, h("div.grow"), clearCache),
+    h("div.small.muted", "What searching the site downloads (the osu! API's answers and the maps' .osu files), kept so the same searches are faster. Clear cache frees the space: the next searches download them again.")));
 
   // advice sensitivity
   const a = cfg.advice;
